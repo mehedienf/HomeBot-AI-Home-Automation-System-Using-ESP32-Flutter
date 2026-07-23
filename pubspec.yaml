@@ -18,8 +18,8 @@ dependencies:
   # State management
   provider: ^6.1.2
 
-  # AI - Google Gemini
-  google_generative_ai: ^0.4.3
+  # AI - OpenRouter (OpenAI-compatible HTTP API)
+  http: ^1.2.2
 
   # Secrets / config loading
   flutter_dotenv: ^5.2.1

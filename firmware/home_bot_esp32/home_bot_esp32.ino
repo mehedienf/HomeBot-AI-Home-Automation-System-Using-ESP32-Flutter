@@ -38,6 +38,8 @@
 
 // Timing (milliseconds).
 #define SENSOR_PERIOD_MS    5000    // publish sensors every 5s
+#define WIFI_RECONNECT_MS   5000    // retry WiFi every 5s if down
+#define STREAM_RECONNECT_MS 30000   // restart streams every 30s as a safety net
 
 // Fan PWM: 4 speeds. 0 = off, 4 = max. Map duty cycle linearly.
 static const uint8_t FAN_DUTY[5] = { 0, 64, 128, 192, 255 };
@@ -57,39 +59,85 @@ SensorState     gSensors    = { 0, 0, 0, false };
 // ===========================================================================
 // 3. FIREBASE / WIFI
 // ===========================================================================
-FirebaseData fbdo;
-FirebaseData fbdoDevices;
-FirebaseData fbdoAutomation;
-FirebaseAuth   auth;
-FirebaseConfig config;
+//
+// IMPORTANT: each Firebase operation that can run concurrently needs its
+// OWN FirebaseData instance. The ESP32 Arduino core is single-threaded
+// but the Firebase ESP client internally stores the last data + payload
+// pointer on each FirebaseData, so reusing one (e.g. `fbdo`) across both
+// the publish loop and stream reads silently corrupts the next read.
+// We allocate one for sensors + one for automation writes + one for
+// pump safety writes.
+//
+FirebaseData    fbdoSensors;       // used by publishSensors()
+FirebaseData    fbdoAutoApply;     // used by handleAutomation() writes
+FirebaseData    fbdoDevices;
+FirebaseData    fbdoAutomation;
+FirebaseAuth    auth;
+FirebaseConfig  config;
 
-unsigned long gLastSensorPublish = 0;
+unsigned long gLastSensorPublish   = 0;
+unsigned long gLastWifiRetry       = 0;
+unsigned long gLastStreamRestart   = 0;
+bool          gStreamsStarted      = false;
+
+// WiFi event group so we know when the link actually drops (rather than
+// reading WL_CONNECTED in a tight loop and getting stale "connected"
+// answers while the radio is mid-roam).
+static volatile bool gWifiConnected = false;
+static volatile bool gWifiJustLost  = false;
+
+void onWifiConnected(WiFiEvent_t event, WiFiEventInfo_t info) {
+  gWifiConnected = true;
+  gWifiJustLost  = false;
+  Serial.printf("\n[wifi] connected, IP=%s, RSSI=%d dBm\n",
+                WiFi.localIP().toString().c_str(), WiFi.RSSI());
+}
+
+void onWifiDisconnected(WiFiEvent_t event, WiFiEventInfo_t info) {
+  if (gWifiConnected) {
+    gWifiJustLost = true;
+  }
+  gWifiConnected = false;
+  Serial.printf("\n[wifi] disconnected (reason=%d)\n", info.wifi_sta_disconnected.reason);
+}
 
 void initWifi() {
+  WiFi.onEvent(onWifiConnected, ARDUINO_EVENT_WIFI_STA_CONNECTED);
+  WiFi.onEvent(onWifiDisconnected, ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
+
+  // `WIFI_TX_POWER_17dBm` is the highest reliable setting on a DevKit
+  // powered by a noisy / current-limited supply (USB chargers that look
+  // fine on a phone but can't sustain an ESP32 burst). Cranking to 19.5
+  // dBm is the #1 cause of "5V external supply but WiFi keeps dropping"
+  // — backing off helps both brownout and RF front-end stability.
+  WiFi.setTxPower(WIFI_TX_POWER_17dBm);
+  WiFi.setSleep(false);  // modem-sleep disables the radio during stream callbacks
+  WiFi.setAutoReconnect(true);
+
   Serial.printf("Connecting to %s", WIFI_SSID);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  WiFi.setSleep(false);
-  while (WiFi.status() != WL_CONNECTED) {
+}
+
+bool waitForWifi(uint32_t timeoutMs) {
+  uint32_t start = millis();
+  while (!gWifiConnected) {
+    if (millis() - start > timeoutMs) return false;
     Serial.print('.');
     delay(500);
   }
   Serial.println();
-  Serial.printf("WiFi up, IP=%s\n", WiFi.localIP().toString().c_str());
+  return gWifiConnected;
 }
 
 void initFirebase() {
   config.api_key      = API_KEY;
+  // Trailing slash on the URL is tolerated by the library but historically
+  // caused 404s on some ESP32 Arduino core versions — keep it trimmed.
   config.database_url = DATABASE_URL;
   auth.user.email     = USER_EMAIL;
   auth.user.password  = USER_PASSWORD;
 
-  // Trust Firebase's TLS root CAs. Without this the SSL handshake fails
-  // with "Failed to initialize the SSL layer" on ESP32 Arduino because
-  // mbedTLS doesn't ship Google Trust Services roots by default.
-  // In Firebase ESP32 Client v4.x the cert goes on `config.cert.data`
-  // which is `const char*` — so we build a heap String and hand back its
-  // C string. The library copies the cert internally; `gCertBuf` lives
-  // for the lifetime of the program.
+  // Trust Firebase's TLS root CAs.
   static String gCertBuf =
       String(FIREBASE_GTS_ROOT_R1) + String(FIREBASE_GTS_CA_1C3);
   config.cert.data = gCertBuf.c_str();
@@ -97,12 +145,22 @@ void initFirebase() {
   Firebase.begin(&config, &auth);
   Firebase.reconnectWiFi(true);
 
-  // One FirebaseData per stream so we know exactly which path produced the
-  // callback - the library uses `fbdo.streamPath()` to identify it.
+  Serial.println("Firebase ready.");
+}
+
+void startStreams() {
+  if (!Firebase.ready()) return;
+  if (gStreamsStarted) {
+    Firebase.endStream(fbdoDevices);
+    Firebase.endStream(fbdoAutomation);
+    gStreamsStarted = false;
+  }
+  // beginStream is idempotent only after endStream, so the reset above
+  // is what lets us recover from "stream silently died after WiFi roam".
   Firebase.beginStream(fbdoDevices,    "/devices");
   Firebase.beginStream(fbdoAutomation, "/automation");
-
-  Serial.println("Firebase ready.");
+  gStreamsStarted = true;
+  Serial.println("[firebase] streams started on /devices and /automation");
 }
 
 // ===========================================================================
@@ -117,22 +175,26 @@ void initPins() {
   pinMode(PIN_SMOKE,       INPUT);
   pinMode(PIN_WATER_LEVEL, INPUT);
 
-  // Fan PWM  (ESP32 Arduino core 3.x LEDC API)
-  //   ledcAttach(pin, freq_hz, resolution_bits)  -> attaches AND configures
-  //   ledcWrite(pin, duty)                       -> uses pin, not channel
   ledcAttach(PIN_FAN_ENABLE, 25000 /*Hz*/, 8 /*bits*/);
+
+  // Start with everything OFF so relays don't jitter at boot before
+  // applyDevicesToHw() runs.
+  digitalWrite(PIN_RELAY_LIGHT, LOW);
+  digitalWrite(PIN_RELAY_PUMP,  LOW);
+  digitalWrite(PIN_RELAY_HUMID, LOW);
+  ledcWrite(PIN_FAN_ENABLE, 0);
 
   dht.begin();
 }
 
 // ===========================================================================
-// 5. ACTUATOR APPLY -  drives the relays + PWM from the cached gDevices.
-//     Called every time gDevices changes, and on startup.
+// 5. ACTUATOR APPLY
 // ===========================================================================
 static void applyFanPwm() {
   if (!gDevices.fan || gDevices.fanSpeed == 0) {
     ledcWrite(PIN_FAN_ENABLE, 0);
   } else {
+    if (gDevices.fanSpeed > 4) gDevices.fanSpeed = 4;
     ledcWrite(PIN_FAN_ENABLE, FAN_DUTY[gDevices.fanSpeed]);
   }
 }
@@ -150,65 +212,49 @@ void applyDevicesToHw() {
 SensorState readSensors() {
   SensorState s = gSensors;        // carry forward last known
 
-  // DHT22 returns NaN on failure - skip if so.
   float t = dht.readTemperature();
   float h = dht.readHumidity();
   if (!isnan(t)) s.temperature = t;
   if (!isnan(h)) s.humidity    = h;
 
-  // Water level - simple analog mapping. Replace with your sensor's
-  // calibration constants. Clamp to 0..100.
   int raw = analogRead(PIN_WATER_LEVEL);
   s.waterLevel = (uint8_t)constrain(map(raw, 0, 4095, 0, 100), 0, 100);
 
-  // Smoke - threshold + simple debounce. Replace with your calibration.
   int smokeRaw = analogRead(PIN_SMOKE);
-  bool smoke = smokeRaw > 1500; // adjust per sensor
-  if (smoke) {
-    s.smokeDetected = true;
-  } else {
-    // Clear unconditionally on a clean reading; the safety net in
-    // handleAutomation() still force-turns the pump off while the smoke
-    // flag is true, so we don't need a manual reset window.
-    s.smokeDetected = false;
-  }
+  s.smokeDetected = smokeRaw > 1500;
 
   return s;
 }
 
 // ===========================================================================
 // 7. SIMPLE AUTOMATION
-//    Mutates gDevices locally when conditions cross thresholds. The change
-//    is mirrored back to RTDB so the UI stays in sync.
+//    Each side-effect write goes through its own FirebaseData so we never
+//    collide with the stream reads / publishSensors().
 // ===========================================================================
 void handleAutomation() {
   if (gAutomation.autoFan && !gDevices.fan && gSensors.temperature > 30.0) {
     gDevices.fan = true;
     gDevices.fanSpeed = 2;
-    Firebase.setBool(fbdo, "/devices/fan", true);
-    Firebase.setInt (fbdo, "/devices/fan_speed", 2);
+    Firebase.setBool(fbdoAutoApply, "/devices/fan", true);
+    Firebase.setInt (fbdoAutoApply, "/devices/fan_speed", 2);
   }
   if (gAutomation.autoHumidifier && !gDevices.humidifier && gSensors.humidity < 35.0) {
     gDevices.humidifier = true;
-    Firebase.setBool(fbdo, "/devices/humidifier", true);
+    Firebase.setBool(fbdoAutoApply, "/devices/humidifier", true);
   }
   if (gAutomation.autoPump && !gDevices.pump && gSensors.waterLevel < 20) {
     gDevices.pump = true;
-    Firebase.setBool(fbdo, "/devices/pump", true);
+    Firebase.setBool(fbdoAutoApply, "/devices/pump", true);
   }
 
-  // SAFETY: if smoke detected, force the pump OFF. Level-triggered so we
-  // catch it on the very first sensor tick after boot, not just on a
-  // rising edge.
   if (gSensors.smokeDetected && gDevices.pump) {
     gDevices.pump = false;
-    Firebase.setBool(fbdo, "/devices/pump", false);
+    Firebase.setBool(fbdoAutoApply, "/devices/pump", false);
   }
 }
 
 // ===========================================================================
-// 9. STREAM CALLBACKS -  invoked (on the main loop) when RTDB data arrives.
-//     Each handler drains its own FirebaseData instance.
+// 9. STREAM CALLBACKS
 // ===========================================================================
 static bool readJsonInto(FirebaseData& fb, const char* path) {
   if (Firebase.get(fb, path)) {
@@ -220,20 +266,18 @@ static bool readJsonInto(FirebaseData& fb, const char* path) {
 }
 
 void handleDevicesStream() {
-  if (!Firebase.ready()) return;
+  if (!gStreamsStarted) return;
   if (!Firebase.readStream(fbdoDevices)) return;
 
-  // Re-fetch the whole tree so we never miss a sibling update that the
-  // stream event happened to consolidate.
   if (readJsonInto(fbdoDevices, "/devices")) {
     FirebaseJson json = fbdoDevices.to<FirebaseJson>();
     FirebaseJsonData result;
     bool tmp;
 
-    if (json.get(result, "light",     tmp)) gDevices.light      = tmp;
-    if (json.get(result, "fan",       tmp)) gDevices.fan        = tmp;
-    if (json.get(result, "pump",      tmp)) gDevices.pump       = tmp;
-    if (json.get(result, "humidifier",tmp)) gDevices.humidifier = tmp;
+    if (json.get(result, "light",      tmp)) gDevices.light      = tmp;
+    if (json.get(result, "fan",        tmp)) gDevices.fan        = tmp;
+    if (json.get(result, "pump",       tmp)) gDevices.pump       = tmp;
+    if (json.get(result, "humidifier", tmp)) gDevices.humidifier = tmp;
 
     int speed;
     if (json.get(result, "fan_speed", speed)) {
@@ -242,12 +286,15 @@ void handleDevicesStream() {
       gDevices.fanSpeed = (uint8_t)speed;
     }
     applyDevicesToHw();
+    Serial.printf("[stream] /devices -> light=%d fan=%d spd=%d pump=%d humid=%d\n",
+                  gDevices.light, gDevices.fan, gDevices.fanSpeed,
+                  gDevices.pump, gDevices.humidifier);
   }
   fbdoDevices.clear();
 }
 
 void handleAutomationStream() {
-  if (!Firebase.ready()) return;
+  if (!gStreamsStarted) return;
   if (!Firebase.readStream(fbdoAutomation)) return;
 
   if (readJsonInto(fbdoAutomation, "/automation")) {
@@ -257,20 +304,27 @@ void handleAutomationStream() {
     if (json.get(result, "auto_fan",        tmp)) gAutomation.autoFan        = tmp;
     if (json.get(result, "auto_humidifier", tmp)) gAutomation.autoHumidifier = tmp;
     if (json.get(result, "auto_pump",       tmp)) gAutomation.autoPump       = tmp;
+    Serial.printf("[stream] /automation -> autoFan=%d autoHumid=%d autoPump=%d\n",
+                  gAutomation.autoFan, gAutomation.autoHumidifier,
+                  gAutomation.autoPump);
   }
   fbdoAutomation.clear();
 }
 
 // ===========================================================================
 // 10. SENSORS PUBLISH
+//    One FirebaseData (`fbdoSensors`) reserved exclusively for these writes.
 // ===========================================================================
 void publishSensors(const SensorState& s) {
-  // Write each field so the UI sees an immediate update even if only one
-  // sensor changed since the last tick.
-  Firebase.setFloat(fbdo, "/sensors/temperature", s.temperature);
-  Firebase.setFloat(fbdo, "/sensors/humidity",    s.humidity);
-  Firebase.setInt  (fbdo, "/sensors/water_level", s.waterLevel);
-  Firebase.setBool (fbdo, "/sensors/smoke_detected", s.smokeDetected);
+  bool ok = true;
+  ok &= Firebase.setFloat(fbdoSensors, "/sensors/temperature",      s.temperature);
+  ok &= Firebase.setFloat(fbdoSensors, "/sensors/humidity",         s.humidity);
+  ok &= Firebase.setInt  (fbdoSensors, "/sensors/water_level",      s.waterLevel);
+  ok &= Firebase.setBool (fbdoSensors, "/sensors/smoke_detected",   s.smokeDetected);
+  if (!ok) {
+    Serial.printf("[publish] /sensors FAIL (reason='%s')\n",
+                  fbdoSensors.errorReason().c_str());
+  }
 }
 
 // ===========================================================================
@@ -283,33 +337,85 @@ void setup() {
 
   initPins();
   initWifi();
+
+  // Wait up to 15 s for the first connection — if the user replaced the
+  // board on a flaky 5V supply we still want a chance to enter loop() and
+  // show diagnostics, not get stuck in initWifi().
+  if (!waitForWifi(15000)) {
+    Serial.println("[wifi] initial connect timed out, will retry in loop()");
+  }
+
+  // Try Firebase init even if WiFi isn't connected yet — the client
+  // re-attaches the SSL socket as soon as WiFi comes back up.
   initFirebase();
 
+  // Give the auth + initial TCP handshake up to 10 s before giving up
+  // for this boot cycle. If it fails we'll just keep looping.
+  for (int i = 0; i < 20 && !Firebase.ready(); i++) {
+    delay(500);
+  }
+  if (Firebase.ready()) {
+    startStreams();
+  } else {
+    Serial.println("[firebase] not ready at boot, will restart streams in loop()");
+  }
+
   applyDevicesToHw();
+  Serial.println("Setup done.");
 }
 
 void loop() {
-  // Drain any pending stream callbacks first.
+  unsigned long now = millis();
+
+  // ---- WiFi watchdog --------------------------------------------------
+  if (!gWifiConnected) {
+    if (now - gLastWifiRetry >= WIFI_RECONNECT_MS) {
+      gLastWifiRetry = now;
+      Serial.println("[wifi] retrying connection...");
+      WiFi.reconnect();
+    }
+  } else if (gWifiJustLost) {
+    gWifiJustLost = false;
+    Serial.println("[wifi] link re-established, restarting Firebase streams");
+    gStreamsStarted = false;
+  }
+
+  // ---- Firebase readiness + streams watchdog --------------------------
   if (Firebase.ready()) {
+    if (!gStreamsStarted) {
+      startStreams();
+    } else if (now - gLastStreamRestart >= STREAM_RECONNECT_MS) {
+      // Safety-net: every 30 s tear down + restart the streams. Without
+      // this the ESP32 happily keeps a "connected" handle while the
+      // server-side long-poll has silently dropped (no callback → app's
+      // toggles never reach us).
+      gLastStreamRestart = now;
+      startStreams();
+    }
+  }
+
+  // ---- Drain stream callbacks ----------------------------------------
+  if (Firebase.ready() && gStreamsStarted) {
     handleDevicesStream();
     handleAutomationStream();
   }
 
-  unsigned long now = millis();
-
+  // ---- Sensor publish (every 5 s) -------------------------------------
   if (now - gLastSensorPublish >= SENSOR_PERIOD_MS) {
     gLastSensorPublish = now;
+    if (!Firebase.ready()) {
+      Serial.println("[publish] skip — Firebase not ready");
+      return;
+    }
     SensorState s = readSensors();
 
-    // Detect state edges (e.g. smoke detected just crossed).
     bool smokeEdge = (s.smokeDetected != gSensors.smokeDetected);
     gSensors = s;
     publishSensors(s);
 
     if (smokeEdge && s.smokeDetected) {
-      // Hard-stop pump on smoke - reflected in handleAutomation() too.
       gDevices.pump = false;
-      Firebase.setBool(fbdo, "/devices/pump", false);
+      Firebase.setBool(fbdoAutoApply, "/devices/pump", false);
     }
 
     handleAutomation();

@@ -1,12 +1,14 @@
 // ============================================================================
 // screens/chat_screen.dart
-// AI Voice + Text assistant powered by Gemini.
+// AI Voice + Text assistant. The AppBar has a segmented selector so the user
+// can swap between the Gemini and OpenRouter upstreams without restarting
+// the app — both providers share the same JSON action format.
 //
 // Flow per user turn:
 //   1) text + mic input -> user utterance string
-//   2) prime Gemini's context with the latest RTDB snapshot (so it can
+//   2) prime the model's context with the latest RTDB snapshot (so it can
 //      answer "how warm is it?" without an extra round-trip).
-//   3) call Gemini -> GeminiAction { reply, db_update }
+//   3) call the active provider -> GeminiAction { reply, db_update }
 //   4) apply db_update to Firebase (the ESP32 sees it immediately because
 //      we also stream `/devices` back into the dashboard).
 //   5) show reply as a chat bubble and speak it via TTS.
@@ -102,6 +104,22 @@ class _ChatScreenState extends State<ChatScreen> {
     });
   }
 
+  /// Switch the upstream model provider at runtime and announce the swap
+  /// in the chat log so the user gets confirmation.
+  void _onProviderChanged(LlmProvider next) {
+    final llm = context.read<GeminiService>();
+    if (llm.provider == next) return;
+    llm.setProvider(next);
+    setState(() {});
+    _addAssistant(
+      next == LlmProvider.gemini && llm.isGeminiMisconfigured
+          ? 'Switched to Gemini, but GEMINI_API_KEY is not configured. '
+              'Add it to .env to start chatting here.'
+          : 'Switched to ${next.label} (${llm.modelName}).',
+      speak: false,
+    );
+  }
+
   Future<void> _toggleListening() async {
     if (_listening) {
       await _voice.stopListening();
@@ -145,6 +163,15 @@ class _ChatScreenState extends State<ChatScreen> {
       final firebase = context.read<FirebaseService>();
       final home = context.read<HomeStateController>();
 
+      // Friendly guard when the user picked Gemini but the key isn't set.
+      if (gemini.isGeminiMisconfigured) {
+        _addAssistant(
+          'Gemini is selected, but GEMINI_API_KEY is not set in .env. '
+          'Add it (or switch the selector above to OpenRouter).',
+        );
+        return;
+      }
+
       // Re-prime the model with the latest home state so it answers
       // status questions accurately and avoids redundant writes.
       gemini.primeContext(
@@ -186,10 +213,42 @@ class _ChatScreenState extends State<ChatScreen> {
 
   @override
   Widget build(BuildContext context) {
+    // Read the active provider here so the AppBar selector rebuilds on
+    // every chat-state change. We don't need to listen for value updates —
+    // calling setState() inside _onProviderChanged already forces a rebuild.
+    final llm = context.watch<GeminiService>();
+    final selected = llm.provider;
+
     return Scaffold(
       appBar: AppBar(
         title: const Text('AI Assistant'),
         actions: [
+          Padding(
+            padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 4),
+            child: SegmentedButton<LlmProvider>(
+              segments: const [
+                ButtonSegment<LlmProvider>(
+                  value: LlmProvider.openrouter,
+                  label: Text('OpenRouter'),
+                  icon: Icon(Icons.cloud_outlined, size: 16),
+                ),
+                ButtonSegment<LlmProvider>(
+                  value: LlmProvider.gemini,
+                  label: Text('Gemini'),
+                  icon: Icon(Icons.auto_awesome, size: 16),
+                ),
+              ],
+              selected: {selected},
+              showSelectedIcon: false,
+              onSelectionChanged: (s) => _onProviderChanged(s.first),
+              style: ButtonStyle(
+                visualDensity: VisualDensity.compact,
+                textStyle: WidgetStatePropertyAll(
+                  Theme.of(context).textTheme.labelSmall,
+                ),
+              ),
+            ),
+          ),
           IconButton(
             tooltip: 'Stop speaking',
             icon: const Icon(Icons.volume_up),

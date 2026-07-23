@@ -1,24 +1,42 @@
 /// ============================================================================
 /// gemini_service.dart
-/// Sends the user's voice/text command to Google Gemini with a strict
-/// system prompt. The prompt forces Gemini to ALWAYS reply with a single JSON
-/// object so the app can execute the resulting Firebase writes mechanically:
+/// Unified LLM client supporting two providers:
 ///
+///   * `LlmProvider.gemini`    -> google_generative_ai (replaces the original
+///                                Gemini REST client; uses the `generativelanguage.googleapis.com`
+///                                endpoint).
+///   * `LlmProvider.openrouter` -> OpenAI-compatible chat-completions API
+///                                at `https://openrouter.ai/api/v1`.
+///
+/// The chat screen shows a segmented selector so the user can pick which
+/// upstream answers each turn without restart. Both providers share the same
+/// system prompt + JSON parsing, so the rest of the app stays untouched.
+///
+/// The action shape is unchanged:
 ///   {
 ///     "reply":     "I've turned on the light for you.",
 ///     "db_update": { "devices/light": true }
 ///   }
-///
-/// `db_update` uses the full RTDB path as the key (e.g. "devices/fan_speed").
-/// Empty `{}` means "no device action required" (e.g. status queries).
 /// ============================================================================
 library;
 
 import 'dart:convert';
 
-import 'package:google_generative_ai/google_generative_ai.dart';
+import 'package:http/http.dart' as http;
+import 'package:flutter/foundation.dart';
 
 import '../models/device_state.dart';
+
+/// Which upstream serves [GeminiService.sendMessage] calls.
+enum LlmProvider {
+  gemini,
+  openrouter;
+
+  String get label => switch (this) {
+        LlmProvider.gemini => 'Gemini',
+        LlmProvider.openrouter => 'OpenRouter',
+      };
+}
 
 class GeminiAction {
   final String reply;
@@ -34,34 +52,95 @@ class GeminiAction {
   }
 }
 
+/// Unified LLM client.
 class GeminiService {
-  GeminiService({required this.apiKey, GenerativeModel? model}) {
-    _model = model ??
-        GenerativeModel(
-          model: 'gemini-2.0-flash',
-          apiKey: apiKey,
-          systemInstruction: Content.system(systemPrompt),
-          generationConfig: GenerationConfig(
-            // Force JSON-only output so we can parse safely.
-            responseMimeType: 'application/json',
-            temperature: 0.2,
-          ),
-        );
+  GeminiService({
+    required this.apiKey,
+    LlmProvider? provider,
+    String? baseUrl,
+    String? model,
+    http.Client? httpClient,
+  })  : _provider = provider ?? LlmProvider.openrouter,
+        _baseUrl = baseUrl ??
+            ((provider ?? LlmProvider.openrouter) == LlmProvider.gemini
+                ? 'https://generativelanguage.googleapis.com/v1beta'
+                : 'https://openrouter.ai/api/v1'),
+        _model = model ??
+            ((provider ?? LlmProvider.openrouter) == LlmProvider.gemini
+                ? 'gemini-flash-latest'
+                : 'meta-llama/llama-3.3-70b-instruct:free'),
+        _http = httpClient ?? http.Client();
+
+  /// Currently active provider. Exposed read-only; use [setProvider] /
+  /// [setApiKey] to swap at runtime from the chat screen.
+  LlmProvider get provider => _provider;
+  LlmProvider _provider;
+
+  /// Base URL used for the active provider.
+  String get baseUrl => _baseUrl;
+
+  /// Model name used for the active provider.
+  String get modelName => _model;
+
+  /// Public, mutable API key so the selector can swap to a different
+  /// provider without recreating the service.
+  String apiKey;
+
+  /// Optional override for Gemini key — populated by main.dart so the
+  /// selector has something to fall back to when switching back from
+  /// OpenRouter to Gemini.
+  String? geminiApiKey;
+
+  /// Optional override for OpenRouter key — populated by main.dart.
+  String? openRouterApiKey;
+
+  /// Model name to use when the active provider is Gemini. Populated by
+  /// main.dart from `GEMINI_MODEL` (default `gemini-2.5-flash`).
+  String? geminiModel;
+
+  /// Model name to use when the active provider is OpenRouter. Defaults
+  /// to whatever the constructor was given (`_model`).
+  String? openRouterModel;
+
+  String _baseUrl;
+  String _model;
+  final http.Client _http;
+
+  /// Swap the active provider. If a key override is set for the target
+  /// provider it is used, otherwise the existing [apiKey] is kept (which
+  /// is fine when both providers share the same key — e.g. OpenRouter).
+  void setProvider(LlmProvider next) {
+    if (next == _provider) return;
+    _provider = next;
+    if (next == LlmProvider.gemini) {
+      if (geminiApiKey != null && geminiApiKey!.isNotEmpty) {
+        apiKey = geminiApiKey!;
+      }
+      _baseUrl = 'https://generativelanguage.googleapis.com/v1beta';
+      // Use the stashed Gemini model if main.dart populated it; otherwise
+      // keep whatever model is currently active (the caller may have
+      // pinned a specific OpenRouter model via --dart-define).
+      // Default falls back to `gemini-flash-latest` alias, which Google
+      // recommends for new API keys (pinned versions 404 with
+      // "no longer available to new users").
+      _model = geminiModel ?? 'gemini-flash-latest';
+    } else if (next == LlmProvider.openrouter) {
+      if (openRouterApiKey != null && openRouterApiKey!.isNotEmpty) {
+        apiKey = openRouterApiKey!;
+      }
+      _baseUrl = 'https://openrouter.ai/api/v1';
+      _model = openRouterModel ?? 'meta-llama/llama-3.3-70b-instruct:free';
+    }
   }
 
-  final String apiKey;
-  late final GenerativeModel _model;
+  /// True when the active provider is Gemini AND we don't have a real key.
+  bool get isGeminiMisconfigured =>
+      _provider == LlmProvider.gemini &&
+      (apiKey.isEmpty || apiKey == 'missing-gemini-api-key');
 
   // ---------------------------------------------------------------------
-  // SYSTEM PROMPT
-  //
-  // The whole behaviour of the assistant is encoded here. We tell Gemini:
-  //   1) the exact schema it must produce,
-  //   2) the full menu of valid RTDB keys so it never invents paths,
-  //   3) the JSON-only constraint (also reinforced by responseMimeType).
-  //
-  // Tweak the "personality" or "examples" sections without changing the
-  // schema and the rest of the app keeps working.
+  // SYSTEM PROMPT (unchanged from the Gemini version so the behaviour is
+  // identical regardless of which model answers).
   // ---------------------------------------------------------------------
   static String get systemPrompt {
     final b = StringBuffer()
@@ -126,7 +205,7 @@ class GeminiService {
   // ---------------------------------------------------------------------
   // Chat history support (so the assistant remembers the last few turns).
   // ---------------------------------------------------------------------
-  final List<Content> _history = [];
+  final List<Map<String, String>> _history = [];
 
   /// Optional pre-seed (e.g. inject latest sensor values) - call before
   /// [sendMessage] when you want the model to know the current state.
@@ -143,23 +222,141 @@ class GeminiService {
       'note':
           'These are the LIVE values from Firebase right now. Use them to answer status questions and to avoid redundant writes.',
     });
-    _history.add(Content.text('CURRENT HOME STATE (read-only context):\n$summary'));
+    _history.add({
+      'role': 'user',
+      'content': 'CURRENT HOME STATE (read-only context):\n$summary',
+    });
+    _history.add({
+      'role': 'assistant',
+      'content': '{"reply":"Got it, I have the latest state.","db_update":{}}',
+    });
   }
 
   /// Sends [userMessage] and returns a parsed [GeminiAction].
-  /// Throws if the response is not valid JSON.
+  /// Throws on network / non-2xx / non-parseable responses.
   Future<GeminiAction> sendMessage(String userMessage) async {
-    final userPart = Content.text(userMessage);
-    _history.add(userPart);
+    _history.add({'role': 'user', 'content': userMessage});
 
-    final response = await _model.generateContent(_history);
-    final raw = response.text ?? '{}';
+    final raw = switch (provider) {
+      LlmProvider.openrouter => await _sendOpenRouter(),
+      LlmProvider.gemini => await _sendGemini(),
+    };
 
-    return _parse(raw);
+    final action = _parse(raw);
+
+    // Mirror the parsed action back into history so the model "remembers".
+    _history.add({
+      'role': 'assistant',
+      'content': jsonEncode({
+        'reply': action.reply,
+        'db_update': action.dbUpdate,
+      }),
+    });
+
+    return action;
   }
 
+  /// OpenAI-compatible chat-completions call. Works for OpenRouter and any
+  /// provider that speaks the same protocol.
+  Future<String> _sendOpenRouter() async {
+    final body = jsonEncode({
+      'model': _model,
+      'temperature': 0.2,
+      'messages': [
+        {'role': 'system', 'content': systemPrompt},
+        ..._history,
+      ],
+    });
+
+    final uri = Uri.parse('$_baseUrl/chat/completions');
+    final response = await _http.post(
+      uri,
+      headers: {
+        'Authorization': 'Bearer $apiKey',
+        'Content-Type': 'application/json',
+        // OpenRouter recommends these two for ranking on the leaderboard.
+        'HTTP-Referer': 'https://homebot.local',
+        'X-Title': 'HomeBot',
+      },
+      body: body,
+    );
+
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw Exception(
+          'OpenRouter HTTP ${response.statusCode}: ${_truncate(response.body, 300)}');
+    }
+
+    final json = jsonDecode(response.body) as Map<String, dynamic>;
+    final choices = json['choices'] as List?;
+    if (choices == null || choices.isEmpty) {
+      throw Exception(
+          'OpenRouter returned no choices: ${_truncate(response.body, 200)}');
+    }
+    final message =
+        (choices.first as Map<String, dynamic>)['message'] as Map<String, dynamic>?;
+    return (message?['content'] as String?)?.trim() ?? '';
+  }
+
+  /// Google Gemini REST call (`generativelanguage.googleapis.com`). We use
+  /// `?key=...` auth (no SDK) so the app stays free of the
+  /// `google_generative_ai` package and works on a single `http.Client`.
+  Future<String> _sendGemini() async {
+    // Convert our internal history (OpenAI-style) into Gemini's
+    // `contents` shape: each turn becomes one Content with a single `text`
+    // part. The system prompt is sent as `systemInstruction`.
+    final contents = <Map<String, dynamic>>[];
+    for (final msg in _history) {
+      contents.add({
+        'role': msg['role'] == 'assistant' ? 'model' : 'user',
+        'parts': [
+          {'text': msg['content']},
+        ],
+      });
+    }
+
+    final body = jsonEncode({
+      'systemInstruction': {
+        'parts': [
+          {'text': systemPrompt},
+        ],
+      },
+      'contents': contents,
+      'generationConfig': {
+        'temperature': 0.2,
+        'responseMimeType': 'application/json',
+      },
+    });
+
+    final uri = Uri.parse('$_baseUrl/models/$_model:generateContent?key=$apiKey');
+    final response = await _http.post(
+      uri,
+      headers: {'Content-Type': 'application/json'},
+      body: body,
+    );
+
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw Exception(
+          'Gemini HTTP ${response.statusCode}: ${_truncate(response.body, 300)}');
+    }
+
+    final json = jsonDecode(response.body) as Map<String, dynamic>;
+    final candidates = json['candidates'] as List?;
+    if (candidates == null || candidates.isEmpty) {
+      throw Exception(
+          'Gemini returned no candidates: ${_truncate(response.body, 200)}');
+    }
+    final content =
+        (candidates.first as Map<String, dynamic>)['content'] as Map<String, dynamic>?;
+    final parts = content?['parts'] as List?;
+    if (parts == null || parts.isEmpty) return '';
+    return (parts.first as Map<String, dynamic>)['text']?.toString().trim() ?? '';
+  }
+
+  static String _truncate(String s, int n) =>
+      s.length <= n ? s : '${s.substring(0, n)}...';
+
   GeminiAction _parse(String raw) {
-    // Gemini occasionally wraps the JSON in ```json fences - strip them.
+    // Models occasionally wrap the JSON in ```json fences - strip them.
     var cleaned = raw.trim();
     if (cleaned.startsWith('```')) {
       cleaned = cleaned
@@ -171,7 +368,8 @@ class GeminiService {
     Map<String, dynamic> json;
     try {
       json = jsonDecode(cleaned) as Map<String, dynamic>;
-    } catch (_) {
+    } catch (e) {
+      debugPrint('OpenRouter response was not JSON: $raw');
       // Fallback: model ignored instructions. Treat the whole reply as text.
       final text = raw.trim().isEmpty ? "I didn't catch that." : raw.trim();
       return GeminiAction(reply: text, dbUpdate: const {});
@@ -183,7 +381,6 @@ class GeminiService {
 
     rawUpdate.forEach((key, value) {
       final k = key.toString();
-      // Coerce values to the type Firebase expects for each known path.
       switch (k) {
         case 'devices/light':
         case 'devices/fan':
@@ -208,9 +405,10 @@ class GeminiService {
       }
     });
 
-    // Keep the model's natural-language reply in history (without the JSON).
-    _history.add(Content.text('Assistant said: $reply'));
-
     return GeminiAction(reply: reply, dbUpdate: dbUpdate);
+  }
+
+  void dispose() {
+    _http.close();
   }
 }

@@ -26,26 +26,63 @@ import 'services/home_state_controller.dart';
 import 'services/voice_service.dart';
 
 // ---------------------------------------------------------------------------
-// Gemini API key lookup.
+// LLM API key lookup (OpenRouter, OpenAI-compatible).
 //
 // Resolution order:
-//   1) `flutter run --dart-define=GEMINI_API_KEY=...`   (CI / production)
-//   2) `GEMINI_API_KEY=...` entry in the .env file      (local development)
+//   1) `flutter run --dart-define=OPENROUTER_API_KEY=...` (CI / production)
+//   2) `OPENROUTER_API_KEY=...` entry in the .env file    (local development)
 //
 // `.env` is listed under `flutter.assets:` in pubspec.yaml so it's bundled
 // and read by `flutter_dotenv` at startup. The .env file itself is gitignored.
+// `OPENROUTER_MODEL` is optional — defaults to `meta-llama/llama-3.3-70b-instruct:free`.
 // ---------------------------------------------------------------------------
-String _resolveGeminiApiKey() {
-  const fromDefine = String.fromEnvironment('GEMINI_API_KEY');
+String _resolveOpenRouterApiKey() {
+  const fromDefine = String.fromEnvironment('OPENROUTER_API_KEY');
   if (fromDefine.isNotEmpty) return fromDefine;
 
-  final fromEnv = dotenv.env['GEMINI_API_KEY'];
+  final fromEnv = dotenv.env['OPENROUTER_API_KEY'];
   if (fromEnv != null && fromEnv.isNotEmpty) return fromEnv;
 
   throw StateError(
-    'GEMINI_API_KEY is not set. Either create a .env file with '
-    'GEMINI_API_KEY=... or run with --dart-define=GEMINI_API_KEY=...',
+    'OPENROUTER_API_KEY is not set. Either create a .env file with '
+    'OPENROUTER_API_KEY=... or run with --dart-define=OPENROUTER_API_KEY=...',
   );
+}
+
+/// Reads the optional `OPENROUTER_MODEL` override. Falls back to the
+/// default Llama 3.3 70B free model if not set.
+String _resolveOpenRouterModel() {
+  const fromDefine = String.fromEnvironment('OPENROUTER_MODEL');
+  if (fromDefine.isNotEmpty) return fromDefine;
+
+  final fromEnv = dotenv.env['OPENROUTER_MODEL'];
+  if (fromEnv != null && fromEnv.isNotEmpty) return fromEnv;
+
+  return 'meta-llama/llama-3.3-70b-instruct:free';
+}
+
+/// Reads the optional Gemini API key (Google AI Studio). Returns null when
+/// the key isn't configured — the chat screen treats that as "Gemini is
+/// unavailable" and disables that selector.
+String? _resolveGeminiApiKey() {
+  const fromDefine = String.fromEnvironment('GEMINI_API_KEY');
+  if (fromDefine.isNotEmpty) return fromDefine;
+  return dotenv.env['GEMINI_API_KEY'];
+}
+
+/// Reads the optional `GEMINI_MODEL` override for the Gemini provider.
+/// Defaults to `gemini-flash-latest` (an alias that always points to the
+/// current stable Flash release). This alias is required for newly-created
+/// API keys — Google 404s on pinned versions like `gemini-2.5-flash` for
+/// those keys with the message "no longer available to new users".
+String _resolveGeminiModel() {
+  const fromDefine = String.fromEnvironment('GEMINI_MODEL');
+  if (fromDefine.isNotEmpty) return fromDefine;
+
+  final fromEnv = dotenv.env['GEMINI_MODEL'];
+  if (fromEnv != null && fromEnv.isNotEmpty) return fromEnv;
+
+  return 'gemini-flash-latest';
 }
 
 Future<void> main() async {
@@ -154,7 +191,26 @@ Future<void> main() async {
             Provider<FirebaseService>.value(value: firebaseService),
             Provider<GeminiService>(
               create: (_) {
-                return GeminiService(apiKey: _resolveGeminiApiKey());
+                // One mutable service shared by both providers — the chat
+                // screen swaps via `setProvider(...)`. We stash both keys
+                // so the selector can flip either way without re-reading
+                // the environment.
+                final orKey = _resolveOpenRouterApiKey();
+                final geminiKey = _resolveGeminiApiKey();
+                final orModel = _resolveOpenRouterModel();
+                final svc = GeminiService(
+                  apiKey: orKey,
+                  provider: LlmProvider.openrouter,
+                  model: orModel,
+                );
+                svc.openRouterApiKey = orKey;
+                svc.openRouterModel = orModel;
+                svc.geminiApiKey =
+                    (geminiKey != null && geminiKey.isNotEmpty) ? geminiKey : null;
+                // Stash the resolved Gemini model so `setProvider()` knows
+                // which model name to swap in when the user picks Gemini.
+                svc.geminiModel = _resolveGeminiModel();
+                return svc;
               },
             ),
             Provider<VoiceService>.value(value: voiceService),
