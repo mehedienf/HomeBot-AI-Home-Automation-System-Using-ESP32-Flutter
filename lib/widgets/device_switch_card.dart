@@ -3,6 +3,7 @@
 /// A row card containing an icon, a name, an action button (open a timer
 /// dialog) and the on/off switch. Used for Light, Pump, Humidifier.
 /// ============================================================================
+library;
 
 import 'package:flutter/material.dart';
 
@@ -34,7 +35,7 @@ class DeviceSwitchCard extends StatelessWidget {
         margin: const EdgeInsets.only(bottom: 12),
         padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
         decoration: BoxDecoration(
-          color: value ? activeColor.withOpacity(0.10) : Colors.white,
+          color: value ? activeColor.withValues(alpha: 0.10) : Colors.white,
           borderRadius: BorderRadius.circular(18),
           border: Border.all(
             color: value ? activeColor : Colors.grey.shade300,
@@ -85,7 +86,7 @@ class DeviceSwitchCard extends StatelessWidget {
             ),
             Switch(
               value: value,
-              activeColor: activeColor,
+              activeThumbColor: activeColor,
               onChanged: disabled ? null : onChanged,
             ),
           ],

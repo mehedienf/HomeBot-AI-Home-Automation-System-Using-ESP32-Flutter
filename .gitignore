@@ -50,3 +50,7 @@ app.*.map.json
 !.env.example
 
 .puku
+
+# ESP32 firmware secrets (loaded via #include "secrets.h")
+firmware/home_bot_esp32/secrets.h
+!firmware/home_bot_esp32/secrets.h.example

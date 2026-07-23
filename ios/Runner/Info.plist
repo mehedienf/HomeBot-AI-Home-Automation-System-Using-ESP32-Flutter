@@ -26,6 +26,10 @@
 	<string>$(FLUTTER_BUILD_NUMBER)</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>HomeBot needs microphone access to listen to your voice commands for the AI assistant.</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>HomeBot uses speech recognition to convert your voice commands into text for the AI assistant.</string>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>

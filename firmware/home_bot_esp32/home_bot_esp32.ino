@@ -15,23 +15,17 @@
 
 #include <Arduino.h>
 #include <WiFi.h>
-#include <Firebase_ESP_Client.h>
+#include <Firebase.h>
 #include <DHT.h>
 
 // ---------------------------------------------------------------------------
 // 1. USER CONFIGURATION
 //    Fill these four values, then upload via Arduino IDE / PlatformIO.
+//    All values live in `secrets.h` (gitignored). Copy `secrets.h.example`
+//    -> `secrets.h` if it doesn't exist.
 // ---------------------------------------------------------------------------
-#define WIFI_SSID       "YOUR_WIFI_SSID"
-#define WIFI_PASSWORD   "YOUR_WIFI_PASSWORD"
-
-// Get these from Firebase Console -> Project Settings -> Service Accounts ->
-// Database secrets (legacy) OR generate a "Database" OAuth token in the
-// Realtime Database tab.
-#define API_KEY         "YOUR_FIREBASE_API_KEY"
-#define DATABASE_URL    "https://YOUR-PROJECT-ID-default-rtdb.firebaseio.com"
-#define USER_EMAIL      "device@homebot.local"
-#define USER_PASSWORD   "YOUR_DATABASE_SECRET_OR_USER_PASSWORD"
+#include "secrets.h"
+#include "firebase_certs.h"
 
 // Hardware pins - change to match your wiring.
 #define PIN_RELAY_LIGHT     26
@@ -44,7 +38,6 @@
 
 // Timing (milliseconds).
 #define SENSOR_PERIOD_MS    5000    // publish sensors every 5s
-#define TIMER_TICK_MS       1000    // check timers every second
 
 // Fan PWM: 4 speeds. 0 = off, 4 = max. Map duty cycle linearly.
 static const uint8_t FAN_DUTY[5] = { 0, 64, 128, 192, 255 };
@@ -61,25 +54,16 @@ DeviceState     gDevices    = { false, false, false, false, 0 };
 AutomationState gAutomation = { true, true, true };
 SensorState     gSensors    = { 0, 0, 0, false };
 
-// Timers are absolute epoch-millis at which a load should auto-off.
-// 0 means "no timer scheduled".
-uint32_t gTimerLightOffAt = 0;
-uint32_t gTimerFanOffAt   = 0;
-uint32_t gTimerPumpOffAt  = 0;
-uint32_t gTimerHumidOffAt = 0;
-
 // ===========================================================================
 // 3. FIREBASE / WIFI
 // ===========================================================================
 FirebaseData fbdo;
 FirebaseData fbdoDevices;
 FirebaseData fbdoAutomation;
-FirebaseData fbdoTimers;
 FirebaseAuth   auth;
 FirebaseConfig config;
 
 unsigned long gLastSensorPublish = 0;
-unsigned long gLastTimerTick     = 0;
 
 void initWifi() {
   Serial.printf("Connecting to %s", WIFI_SSID);
@@ -99,14 +83,24 @@ void initFirebase() {
   auth.user.email     = USER_EMAIL;
   auth.user.password  = USER_PASSWORD;
 
+  // Trust Firebase's TLS root CAs. Without this the SSL handshake fails
+  // with "Failed to initialize the SSL layer" on ESP32 Arduino because
+  // mbedTLS doesn't ship Google Trust Services roots by default.
+  // In Firebase ESP32 Client v4.x the cert goes on `config.cert.data`
+  // which is `const char*` — so we build a heap String and hand back its
+  // C string. The library copies the cert internally; `gCertBuf` lives
+  // for the lifetime of the program.
+  static String gCertBuf =
+      String(FIREBASE_GTS_ROOT_R1) + String(FIREBASE_GTS_CA_1C3);
+  config.cert.data = gCertBuf.c_str();
+
   Firebase.begin(&config, &auth);
   Firebase.reconnectWiFi(true);
 
   // One FirebaseData per stream so we know exactly which path produced the
-  // callback - the library uses the `fbdo.stream().path()` to identify it.
-  Firebase.beginStream(&fbdoDevices,    "/devices");
-  Firebase.beginStream(&fbdoAutomation, "/automation");
-  Firebase.beginStream(&fbdoTimers,     "/timers");
+  // callback - the library uses `fbdo.streamPath()` to identify it.
+  Firebase.beginStream(fbdoDevices,    "/devices");
+  Firebase.beginStream(fbdoAutomation, "/automation");
 
   Serial.println("Firebase ready.");
 }
@@ -123,9 +117,10 @@ void initPins() {
   pinMode(PIN_SMOKE,       INPUT);
   pinMode(PIN_WATER_LEVEL, INPUT);
 
-  // Fan PWM
-  ledcAttachPin(PIN_FAN_ENABLE, FAN_PWM_CHANNEL);
-  ledcSetup(FAN_PWM_CHANNEL, 25000 /*Hz*/, 8 /*bits*/);
+  // Fan PWM  (ESP32 Arduino core 3.x LEDC API)
+  //   ledcAttach(pin, freq_hz, resolution_bits)  -> attaches AND configures
+  //   ledcWrite(pin, duty)                       -> uses pin, not channel
+  ledcAttach(PIN_FAN_ENABLE, 25000 /*Hz*/, 8 /*bits*/);
 
   dht.begin();
 }
@@ -136,9 +131,9 @@ void initPins() {
 // ===========================================================================
 static void applyFanPwm() {
   if (!gDevices.fan || gDevices.fanSpeed == 0) {
-    ledcWrite(FAN_PWM_CHANNEL, 0);
+    ledcWrite(PIN_FAN_ENABLE, 0);
   } else {
-    ledcWrite(FAN_PWM_CHANNEL, FAN_DUTY[gDevices.fanSpeed]);
+    ledcWrite(PIN_FAN_ENABLE, FAN_DUTY[gDevices.fanSpeed]);
   }
 }
 
@@ -171,7 +166,10 @@ SensorState readSensors() {
   bool smoke = smokeRaw > 1500; // adjust per sensor
   if (smoke) {
     s.smokeDetected = true;
-  } else if (!gDevices.pump /*only clear after manual reset*/) {
+  } else {
+    // Clear unconditionally on a clean reading; the safety net in
+    // handleAutomation() still force-turns the pump off while the smoke
+    // flag is true, so we don't need a manual reset window.
     s.smokeDetected = false;
   }
 
@@ -179,38 +177,7 @@ SensorState readSensors() {
 }
 
 // ===========================================================================
-// 7. TIMERS - 1 Hz tick. Check each /timers/*_off_time epoch and turn off
-//    the corresponding load if it has passed.
-// ===========================================================================
-void handleTimers() {
-  uint32_t now = (uint32_t)(millis() / 1000UL) * 1000UL; // optional: use NTP
-
-  if (gTimerLightOffAt && now >= gTimerLightOffAt) {
-    gDevices.light = false;
-    gTimerLightOffAt = 0;
-    Firebase.RTDB.setBool(&fbdo, "/devices/light", false);
-  }
-  if (gTimerFanOffAt && now >= gTimerFanOffAt) {
-    gDevices.fan = false;
-    gDevices.fanSpeed = 0;
-    gTimerFanOffAt = 0;
-    Firebase.RTDB.setBool(&fbdo, "/devices/fan", false);
-    Firebase.RTDB.setInt (&fbdo, "/devices/fan_speed", 0);
-  }
-  if (gTimerPumpOffAt && now >= gTimerPumpOffAt) {
-    gDevices.pump = false;
-    gTimerPumpOffAt = 0;
-    Firebase.RTDB.setBool(&fbdo, "/devices/pump", false);
-  }
-  if (gTimerHumidOffAt && now >= gTimerHumidOffAt) {
-    gDevices.humidifier = false;
-    gTimerHumidOffAt = 0;
-    Firebase.RTDB.setBool(&fbdo, "/devices/humidifier", false);
-  }
-}
-
-// ===========================================================================
-// 8. SIMPLE AUTOMATION
+// 7. SIMPLE AUTOMATION
 //    Mutates gDevices locally when conditions cross thresholds. The change
 //    is mirrored back to RTDB so the UI stays in sync.
 // ===========================================================================
@@ -218,23 +185,24 @@ void handleAutomation() {
   if (gAutomation.autoFan && !gDevices.fan && gSensors.temperature > 30.0) {
     gDevices.fan = true;
     gDevices.fanSpeed = 2;
-    Firebase.RTDB.setBool(&fbdo, "/devices/fan", true);
-    Firebase.RTDB.setInt (&fbdo, "/devices/fan_speed", 2);
+    Firebase.setBool(fbdo, "/devices/fan", true);
+    Firebase.setInt (fbdo, "/devices/fan_speed", 2);
   }
   if (gAutomation.autoHumidifier && !gDevices.humidifier && gSensors.humidity < 35.0) {
     gDevices.humidifier = true;
-    Firebase.RTDB.setBool(&fbdo, "/devices/humidifier", true);
+    Firebase.setBool(fbdo, "/devices/humidifier", true);
   }
   if (gAutomation.autoPump && !gDevices.pump && gSensors.waterLevel < 20) {
     gDevices.pump = true;
-    Firebase.RTDB.setBool(&fbdo, "/devices/pump", true);
+    Firebase.setBool(fbdo, "/devices/pump", true);
   }
 
-  // SAFETY: if smoke detected, force the pump OFF.
+  // SAFETY: if smoke detected, force the pump OFF. Level-triggered so we
+  // catch it on the very first sensor tick after boot, not just on a
+  // rising edge.
   if (gSensors.smokeDetected && gDevices.pump) {
     gDevices.pump = false;
-    gTimerPumpOffAt = 0;
-    Firebase.RTDB.setBool(&fbdo, "/devices/pump", false);
+    Firebase.setBool(fbdo, "/devices/pump", false);
   }
 }
 
@@ -243,7 +211,7 @@ void handleAutomation() {
 //     Each handler drains its own FirebaseData instance.
 // ===========================================================================
 static bool readJsonInto(FirebaseData& fb, const char* path) {
-  if (Firebase.RTDB.get(&fb, path)) {
+  if (Firebase.get(fb, path)) {
     if (fb.dataType() == "json") {
       return true;
     }
@@ -253,7 +221,7 @@ static bool readJsonInto(FirebaseData& fb, const char* path) {
 
 void handleDevicesStream() {
   if (!Firebase.ready()) return;
-  if (!fbdoDevices.stream().available()) return;
+  if (!Firebase.readStream(fbdoDevices)) return;
 
   // Re-fetch the whole tree so we never miss a sibling update that the
   // stream event happened to consolidate.
@@ -275,12 +243,12 @@ void handleDevicesStream() {
     }
     applyDevicesToHw();
   }
-  fbdoDevices.stream().clear();
+  fbdoDevices.clear();
 }
 
 void handleAutomationStream() {
   if (!Firebase.ready()) return;
-  if (!fbdoAutomation.stream().available()) return;
+  if (!Firebase.readStream(fbdoAutomation)) return;
 
   if (readJsonInto(fbdoAutomation, "/automation")) {
     FirebaseJson json = fbdoAutomation.to<FirebaseJson>();
@@ -290,24 +258,7 @@ void handleAutomationStream() {
     if (json.get(result, "auto_humidifier", tmp)) gAutomation.autoHumidifier = tmp;
     if (json.get(result, "auto_pump",       tmp)) gAutomation.autoPump       = tmp;
   }
-  fbdoAutomation.stream().clear();
-}
-
-void handleTimersStream() {
-  if (!Firebase.ready()) return;
-  if (!fbdoTimers.stream().available()) return;
-
-  if (readJsonInto(fbdoTimers, "/timers")) {
-    FirebaseJson json = fbdoTimers.to<FirebaseJson>();
-    FirebaseJsonData result;
-    int v;
-
-    if (json.get(result, "light_off_time",      v)) gTimerLightOffAt = (uint32_t)v;
-    if (json.get(result, "fan_off_time",        v)) gTimerFanOffAt   = (uint32_t)v;
-    if (json.get(result, "pump_off_time",       v)) gTimerPumpOffAt  = (uint32_t)v;
-    if (json.get(result, "humidifier_off_time", v)) gTimerHumidOffAt = (uint32_t)v;
-  }
-  fbdoTimers.stream().clear();
+  fbdoAutomation.clear();
 }
 
 // ===========================================================================
@@ -316,10 +267,10 @@ void handleTimersStream() {
 void publishSensors(const SensorState& s) {
   // Write each field so the UI sees an immediate update even if only one
   // sensor changed since the last tick.
-  Firebase.RTDB.setFloat(&fbdo, "/sensors/temperature", s.temperature);
-  Firebase.RTDB.setFloat(&fbdo, "/sensors/humidity",    s.humidity);
-  Firebase.RTDB.setInt  (&fbdo, "/sensors/water_level", s.waterLevel);
-  Firebase.RTDB.setBool (&fbdo, "/sensors/smoke_detected", s.smokeDetected);
+  Firebase.setFloat(fbdo, "/sensors/temperature", s.temperature);
+  Firebase.setFloat(fbdo, "/sensors/humidity",    s.humidity);
+  Firebase.setInt  (fbdo, "/sensors/water_level", s.waterLevel);
+  Firebase.setBool (fbdo, "/sensors/smoke_detected", s.smokeDetected);
 }
 
 // ===========================================================================
@@ -333,6 +284,7 @@ void setup() {
   initPins();
   initWifi();
   initFirebase();
+
   applyDevicesToHw();
 }
 
@@ -341,7 +293,6 @@ void loop() {
   if (Firebase.ready()) {
     handleDevicesStream();
     handleAutomationStream();
-    handleTimersStream();
   }
 
   unsigned long now = millis();
@@ -358,16 +309,10 @@ void loop() {
     if (smokeEdge && s.smokeDetected) {
       // Hard-stop pump on smoke - reflected in handleAutomation() too.
       gDevices.pump = false;
-      Firebase.RTDB.setBool(&fbdo, "/devices/pump", false);
+      Firebase.setBool(fbdo, "/devices/pump", false);
     }
 
     handleAutomation();
-    applyDevicesToHw();
-  }
-
-  if (now - gLastTimerTick >= TIMER_TICK_MS) {
-    gLastTimerTick = now;
-    handleTimers();
     applyDevicesToHw();
   }
 }

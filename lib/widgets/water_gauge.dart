@@ -3,6 +3,7 @@
 /// Visual vertical water-tank indicator driven by percent_indicator.
 /// Colour shifts as the level drops so a glance tells you when to refill.
 /// ============================================================================
+library;
 
 import 'package:flutter/material.dart';
 import 'package:percent_indicator/linear_percent_indicator.dart';
@@ -45,7 +46,7 @@ class WaterGauge extends StatelessWidget {
         borderRadius: BorderRadius.circular(20),
         boxShadow: [
           BoxShadow(
-            color: Colors.black.withOpacity(0.05),
+            color: Colors.black.withValues(alpha: 0.05),
             blurRadius: 10,
             offset: const Offset(0, 4),
           ),

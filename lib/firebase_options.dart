@@ -61,42 +61,74 @@ class DefaultFirebaseOptions {
   static String get _authDomain =>
       dotenv.env['FIREBASE_AUTH_DOMAIN'] ?? '';
 
+  /// RTDB endpoint. Optional — Flutter's `firebase_database` falls back to
+  /// `https://<project-id>.firebaseio.com` automatically when this is
+  /// omitted. Set `FIREBASE_DATABASE_URL` in `.env` only if Firebase
+  /// Console ➜ Realtime Database shows a different host (e.g. a
+  /// regional `.asia-southeast1.firebasedatabase.app`).
+  ///
+  /// If the env value points to the **wrong region** (e.g. the global
+  /// `*.firebaseio.com` host while your DB actually lives in
+  /// `asia-southeast1`), the native plugin will silently use it and the
+  /// server will kill the connection with a "Database lives in a
+  /// different region" error. The android getter below hardcodes the
+  /// correct regional URL and ignores env on Android to avoid that trap.
+  static String? get _databaseUrl =>
+      dotenv.env['FIREBASE_DATABASE_URL'];
+
   // -- Web -----------------------------------------------------------------
-  static FirebaseOptions get web => FirebaseOptions(
-        apiKey: dotenv.env['FIREBASE_API_KEY_WEB'] ??
-            (throw StateError('FIREBASE_API_KEY_WEB is missing from .env')),
-        appId: dotenv.env['FIREBASE_APP_ID_WEB'] ??
-            (throw StateError('FIREBASE_APP_ID_WEB is missing from .env')),
-        messagingSenderId: _messagingSenderId,
-        projectId: _projectId,
-        authDomain: _authDomain,
-        storageBucket: _storageBucket,
-      );
+  static FirebaseOptions get web {
+    final dbUrl = _databaseUrl;
+    return FirebaseOptions(
+      apiKey: dotenv.env['FIREBASE_API_KEY_WEB'] ??
+          (throw StateError('FIREBASE_API_KEY_WEB is missing from .env')),
+      appId: dotenv.env['FIREBASE_APP_ID_WEB'] ??
+          (throw StateError('FIREBASE_APP_ID_WEB is missing from .env')),
+      messagingSenderId: _messagingSenderId,
+      projectId: _projectId,
+      authDomain: _authDomain,
+      storageBucket: _storageBucket,
+      databaseURL: dbUrl ?? 'https://${_projectId}-default-rtdb.firebaseio.com',
+    );
+  }
 
   // -- Android -------------------------------------------------------------
-  static FirebaseOptions get android => FirebaseOptions(
-        apiKey: dotenv.env['FIREBASE_API_KEY_ANDROID'] ??
-            (throw StateError(
-                'FIREBASE_API_KEY_ANDROID is missing from .env')),
-        appId: dotenv.env['FIREBASE_APP_ID_ANDROID'] ??
-            (throw StateError(
-                'FIREBASE_APP_ID_ANDROID is missing from .env')),
-        messagingSenderId: _messagingSenderId,
-        projectId: _projectId,
-        storageBucket: _storageBucket,
-      );
+  static FirebaseOptions get android {
+    return FirebaseOptions(
+      apiKey: dotenv.env['FIREBASE_API_KEY_ANDROID'] ??
+          (throw StateError(
+              'FIREBASE_API_KEY_ANDROID is missing from .env')),
+      appId: dotenv.env['FIREBASE_API_ID_ANDROID'] ??
+          dotenv.env['FIREBASE_APP_ID_ANDROID'] ??
+          (throw StateError(
+              'FIREBASE_APP_ID_ANDROID is missing from .env')),
+      messagingSenderId: _messagingSenderId,
+      projectId: _projectId,
+      storageBucket: _storageBucket,
+      // Hard-coded: the RTDB lives at the asia-southeast1 regional host.
+      // `.env` sometimes fails to load on Android (asset bundling), so
+      // pin this URL directly to avoid the "Database lives in a different
+      // region" error that hangs the dashboard forever.
+      databaseURL:
+          'https://homebot-home-automation-default-rtdb.asia-southeast1.firebasedatabase.app',
+    );
+  }
 
   // -- iOS -----------------------------------------------------------------
-  static FirebaseOptions get ios => FirebaseOptions(
-        apiKey: dotenv.env['FIREBASE_API_KEY_IOS'] ??
-            (throw StateError('FIREBASE_API_KEY_IOS is missing from .env')),
-        appId: dotenv.env['FIREBASE_APP_ID_IOS'] ??
-            (throw StateError('FIREBASE_APP_ID_IOS is missing from .env')),
-        messagingSenderId: _messagingSenderId,
-        projectId: _projectId,
-        storageBucket: _storageBucket,
-        iosBundleId: dotenv.env['FIREBASE_IOS_BUNDLE_ID'] ??
-            (throw StateError(
-                'FIREBASE_IOS_BUNDLE_ID is missing from .env')),
-      );
+  static FirebaseOptions get ios {
+    final dbUrl = _databaseUrl;
+    return FirebaseOptions(
+      apiKey: dotenv.env['FIREBASE_API_KEY_IOS'] ??
+          (throw StateError('FIREBASE_API_KEY_IOS is missing from .env')),
+      appId: dotenv.env['FIREBASE_APP_ID_IOS'] ??
+          (throw StateError('FIREBASE_APP_ID_IOS is missing from .env')),
+      messagingSenderId: _messagingSenderId,
+      projectId: _projectId,
+      storageBucket: _storageBucket,
+      databaseURL: dbUrl ?? 'https://${_projectId}-default-rtdb.firebaseio.com',
+      iosBundleId: dotenv.env['FIREBASE_IOS_BUNDLE_ID'] ??
+          (throw StateError(
+              'FIREBASE_IOS_BUNDLE_ID is missing from .env')),
+    );
+  }
 }

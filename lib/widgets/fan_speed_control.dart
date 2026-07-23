@@ -4,6 +4,7 @@
 /// to `/devices/fan_speed` and toggles `/devices/fan` to true at the same
 /// time so the ESP32 doesn't need to read two nodes for state.
 /// ============================================================================
+library;
 
 import 'package:flutter/material.dart';
 

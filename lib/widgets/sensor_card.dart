@@ -2,6 +2,7 @@
 /// widgets/sensor_card.dart
 /// Pretty card for showing a single sensor reading (Temp / Humidity).
 /// ============================================================================
+library;
 
 import 'package:flutter/material.dart';
 
@@ -26,9 +27,9 @@ class SensorCard extends StatelessWidget {
     return Container(
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
-        color: color.withOpacity(0.12),
+        color: color.withValues(alpha: 0.12),
         borderRadius: BorderRadius.circular(20),
-        border: Border.all(color: color.withOpacity(0.4)),
+        border: Border.all(color: color.withValues(alpha: 0.4)),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,

@@ -14,6 +14,7 @@
 /// Errors are swallowed + logged; we never want a mic failure to crash the
 /// chat experience.
 /// ============================================================================
+library;
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter_tts/flutter_tts.dart';

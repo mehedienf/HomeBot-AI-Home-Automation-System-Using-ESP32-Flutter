@@ -12,6 +12,7 @@
 /// `db_update` uses the full RTDB path as the key (e.g. "devices/fan_speed").
 /// Empty `{}` means "no device action required" (e.g. status queries).
 /// ============================================================================
+library;
 
 import 'dart:convert';
 
@@ -37,7 +38,7 @@ class GeminiService {
   GeminiService({required this.apiKey, GenerativeModel? model}) {
     _model = model ??
         GenerativeModel(
-          model: 'gemini-1.5-flash',
+          model: 'gemini-2.0-flash',
           apiKey: apiKey,
           systemInstruction: Content.system(systemPrompt),
           generationConfig: GenerationConfig(

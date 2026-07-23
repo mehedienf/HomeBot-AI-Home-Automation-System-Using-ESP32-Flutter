@@ -4,6 +4,7 @@
 /// ESP32 sets `sensors/smoke_detected = true`. Includes a dismiss action so
 /// the user can scroll past it once they've been alerted.
 /// ============================================================================
+library;
 
 import 'package:flutter/material.dart';
 
@@ -63,7 +64,7 @@ class _FireAlertBannerState extends State<FireAlertBanner>
             color: Colors.red.shade700,
             boxShadow: [
               BoxShadow(
-                color: Colors.red.withOpacity(0.4),
+                color: Colors.red.withValues(alpha: 0.4),
                 blurRadius: 12,
                 offset: const Offset(0, 4),
               ),

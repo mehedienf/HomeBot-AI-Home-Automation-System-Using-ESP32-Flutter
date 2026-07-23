@@ -16,7 +16,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_spinkit/flutter_spinkit.dart';
 import 'package:provider/provider.dart';
 
-import '../models/device_state.dart';
+
 import '../services/home_state_controller.dart';
 import '../widgets/alert_banner.dart';
 import '../widgets/device_switch_card.dart';
@@ -35,6 +35,19 @@ class HomeScreen extends StatefulWidget {
 
 class _HomeScreenState extends State<HomeScreen> {
   bool _alertDismissed = false;
+
+  // Don't sit on a spinner forever if the RTDB stream hasn't fired yet
+  // (e.g. cold start, auth delay, network blip). After 2.5 s we render
+  // the rest of the dashboard so the user always sees *something*.
+  bool _loadingTimedOut = false;
+  @override
+  void initState() {
+    super.initState();
+    Future.delayed(const Duration(milliseconds: 2500), () {
+      if (!mounted) return;
+      setState(() => _loadingTimedOut = true);
+    });
+  }
 
   Future<void> _setTimerFor(DeviceId device, String label) async {
     final state = context.read<HomeStateController>();
@@ -95,8 +108,25 @@ class _HomeScreenState extends State<HomeScreen> {
               });
             },
           ),
+          if (state.lastError != null)
+            Container(
+              width: double.infinity,
+              margin: const EdgeInsets.fromLTRB(16, 12, 16, 0),
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: const Color(0xFFFFF3E0),
+                borderRadius: BorderRadius.circular(10),
+                border: Border.all(color: Colors.orange.shade300),
+              ),
+              child: Text(
+                'Realtime DB error: ${state.lastError}',
+                style: const TextStyle(fontSize: 12, color: Color(0xFF6D4C41)),
+              ),
+            ),
           Expanded(
-            child: state.snapshot == const HomeSnapshot()
+            child: (!state.hasReceived &&
+                    !_loadingTimedOut &&
+                    state.lastError == null)
                 ? const Center(child: SpinKitFadingCube(color: Colors.indigo))
                 : RefreshIndicator(
                     onRefresh: () async {

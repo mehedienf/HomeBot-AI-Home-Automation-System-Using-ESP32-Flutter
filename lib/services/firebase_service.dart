@@ -34,19 +34,27 @@ class FirebaseService {
   // --- Streams (live UI sync) ---------------------------------------------
 
   /// Emits a [DeviceState] every time ESP32 (or anyone else) writes to
-  /// `/devices`.
+  /// `/devices`. If the node is missing (first boot, ESP offline) the stream
+  /// still emits a sane default so the UI can render "loading…" → "all off"
+  /// instead of hanging.
   Stream<DeviceState> get devicesStream => _devicesRef.onValue.map((event) {
-        return DeviceState.fromMap(event.snapshot.value as Map<dynamic, dynamic>?);
+        final raw = event.snapshot.value;
+        if (raw is! Map) return const DeviceState();
+        return DeviceState.fromMap(raw);
       });
 
-  Stream<AutomationState> get automationStream => _automationRef.onValue.map((event) {
-        return AutomationState.fromMap(event.snapshot.value as Map<dynamic, dynamic>?);
+  Stream<AutomationState> get automationStream =>
+      _automationRef.onValue.map((event) {
+        final raw = event.snapshot.value;
+        if (raw is! Map) return const AutomationState();
+        return AutomationState.fromMap(raw);
       });
 
   Stream<SensorState> get sensorsStream => _sensorsRef.onValue.map((event) {
-        return SensorState.fromMap(event.snapshot.value as Map<dynamic, dynamic>?);
+        final raw = event.snapshot.value;
+        if (raw is! Map) return const SensorState();
+        return SensorState.fromMap(raw);
       });
-
   // --- Writes --------------------------------------------------------------
 
   Future<void> setDevice({
@@ -61,13 +69,23 @@ class FirebaseService {
     if (pump != null) updates['pump'] = pump;
     if (humidifier != null) updates['humidifier'] = humidifier;
     if (updates.isEmpty) return;
-    await _devicesRef.update(updates);
+    try {
+      await _devicesRef.update(updates);
+    } catch (e, st) {
+      debugPrint('setDevice failed: $e\n$st');
+      rethrow;
+    }
   }
 
   /// fanSpeed is a discrete 0..4 integer that maps to the ESP32 PWM duty.
-  Future<void> setFanSpeed(int speed) {
+  Future<void> setFanSpeed(int speed) async {
     final clamped = speed.clamp(0, 4);
-    return _devicesRef.update({'fan_speed': clamped});
+    try {
+      await _devicesRef.update({'fan_speed': clamped});
+    } catch (e, st) {
+      debugPrint('setFanSpeed failed: $e\n$st');
+      rethrow;
+    }
   }
 
   Future<void> setAutomationFlag({
@@ -80,7 +98,12 @@ class FirebaseService {
     if (autoHumidifier != null) updates['auto_humidifier'] = autoHumidifier;
     if (autoPump != null) updates['auto_pump'] = autoPump;
     if (updates.isEmpty) return;
-    return _automationRef.update(updates);
+    try {
+      await _automationRef.update(updates);
+    } catch (e, st) {
+      debugPrint('setAutomationFlag failed: $e\n$st');
+      rethrow;
+    }
   }
 
   /// Schedules a one-shot "turn off" for a load. ESP32 watches `/timers/*`
@@ -106,10 +129,39 @@ class FirebaseService {
   /// Apply a generic key->value patch produced by the Gemini service.
   /// `db_update` is expected to look like:
   ///   {"devices/light": true, "devices/fan_speed": 3, "timers/pump_off_time": 0}
+  ///
+  /// Whitelisted paths only — anything outside the allow-list is silently
+  /// dropped so a creative model can't write to arbitrary RTDB nodes
+  /// (e.g. `/users`, `/config`, or someone else's project).
+  static const Set<String> _allowedGeminiPaths = {
+    'devices/light',
+    'devices/fan',
+    'devices/fan_speed',
+    'devices/pump',
+    'devices/humidifier',
+    'automation/auto_fan',
+    'automation/auto_humidifier',
+    'automation/auto_pump',
+    'timers/light_off_time',
+    'timers/fan_off_time',
+    'timers/pump_off_time',
+    'timers/humidifier_off_time',
+  };
+
   Future<void> applyGeminiUpdates(Map<String, dynamic> dbUpdate) async {
     if (dbUpdate.isEmpty) return;
+    final filtered = <String, dynamic>{};
+    dbUpdate.forEach((key, value) {
+      final k = key.toString();
+      if (_allowedGeminiPaths.contains(k)) {
+        filtered[k] = value;
+      } else {
+        debugPrint('applyGeminiUpdates: dropping non-whitelisted path "$k"');
+      }
+    });
+    if (filtered.isEmpty) return;
     try {
-      await _db.ref('/').update(dbUpdate);
+      await _db.ref('/').update(filtered);
     } catch (e) {
       debugPrint('applyGeminiUpdates failed: $e');
     }

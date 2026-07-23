@@ -4,6 +4,7 @@
 /// minutes" duration for a given load. Returns the chosen Duration, or
 /// null if the user cancelled.
 /// ============================================================================
+library;
 
 import 'package:flutter/material.dart';
 
