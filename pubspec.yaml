@@ -1,0 +1,50 @@
+name: home_bot
+description: "Voice & Text Controlled Smart Home Automation App with Gemini AI."
+publish_to: 'none'
+version: 0.1.0+1
+
+environment:
+  sdk: ^3.12.1
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # Firebase
+  firebase_core: ^3.6.0
+  firebase_database: ^11.1.4
+
+  # State management
+  provider: ^6.1.2
+
+  # AI - Google Gemini
+  google_generative_ai: ^0.4.3
+
+  # Secrets / config loading
+  flutter_dotenv: ^5.2.1
+
+  # Voice I/O
+  speech_to_text: ^7.0.0
+  flutter_tts: ^4.2.0
+
+  # UI helpers
+  percent_indicator: ^4.0.1
+  flutter_spinkit: ^5.2.1
+  intl: ^0.19.0
+
+  # Permissions (mic)
+  permission_handler: ^11.3.1
+
+  cupertino_icons: ^1.0.8
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+
+flutter:
+  uses-material-design: true
+
+  # Load runtime secrets from .env at the project root.
+  assets:
+    - .env
