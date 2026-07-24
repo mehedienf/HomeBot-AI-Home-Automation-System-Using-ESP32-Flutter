@@ -1,5 +1,5 @@
 // ============================================================================
-// HomeBot - ESP32 Firmware (Refined & Fixed with Ultrasonic)
+// HomeBot - ESP32 Firmware (Updated with Fan Relay & Servo Speed Control)
 // ============================================================================
 
 #include <Arduino.h>
@@ -10,6 +10,7 @@
 #include <addons/TokenHelper.h>
 #include <addons/RTDBHelper.h>
 #include <DHT.h>
+#include <ESP32Servo.h> // ESP32 Servo Library
 
 #include "secrets.h"
 #include "firebase_certs.h"
@@ -18,7 +19,8 @@
 #define PIN_RELAY_LIGHT     26
 #define PIN_RELAY_PUMP      27
 #define PIN_RELAY_HUMID     14
-#define PIN_FAN_ENABLE      25      // MOSFET gate (PWM)
+#define PIN_RELAY_FAN       25      // Fan ON/OFF Relay
+#define PIN_SERVO_FAN       18      // Servo Signal Pin for Fan Speed
 #define PIN_DHT             4
 #define PIN_SMOKE           34      // analog
 #define PIN_ECHO            35      // Ultrasonic Echo (Input)
@@ -32,8 +34,8 @@
 #define TANK_DEPTH_CM       30     // সেন্সর থেকে পানির সর্বোচ্চ দূরত্ব যখন ট্যাংক খালি (0%)
 #define TANK_FULL_GAP_CM    1      // সেন্সর থেকে পানির সর্বনিম্ন দূরত্ব যখন ট্যাংক ভর্তি (100%)
 
-// Fan PWM
-const uint8_t FAN_DUTY[5] = { 0, 64, 128, 192, 255 };
+// Servo Instance
+Servo fanServo;
 
 // ===========================================================================
 // STATE STRUCTS
@@ -48,13 +50,10 @@ struct TimerState {
   uint64_t pumpOffTime; 
 };
 
-TimerState gTimers = {0, 0, 0, 0};
-FirebaseData fbdoTimers; // টাইমারের জন্য নতুন ফায়ারবেস স্ট্রিম
-
+TimerState      gTimers     = {0, 0, 0, 0};
 DeviceState     gDevices    = { false, false, false, false, 0 };
 AutomationState gAutomation = { true, true, true };
 SensorState     gSensors    = { 0.0, 0.0, 0, false, 0 };
-
 
 // ===========================================================================
 // FIREBASE & INSTANCES
@@ -63,6 +62,7 @@ FirebaseData    fbdoSensors;
 FirebaseData    fbdoAutoApply;     
 FirebaseData    fbdoDevices;       
 FirebaseData    fbdoAutomation;    
+FirebaseData    fbdoTimers;        
 FirebaseAuth    auth;
 FirebaseConfig  config;
 
@@ -78,6 +78,7 @@ void onDevicesStream(StreamData data);
 void onAutomationStream(StreamData data);
 void onTimersStream(StreamData data);
 void onStreamTimeout(bool timeout, FirebaseData& fb);
+bool parseBoolData(FirebaseJsonData& result);
 
 // ===========================================================================
 // HARDWARE INIT & CONTROL
@@ -86,6 +87,7 @@ void initPins() {
   pinMode(PIN_RELAY_LIGHT, OUTPUT);
   pinMode(PIN_RELAY_PUMP,  OUTPUT);
   pinMode(PIN_RELAY_HUMID, OUTPUT);
+  pinMode(PIN_RELAY_FAN,   OUTPUT);
   pinMode(PIN_SMOKE,       INPUT);
   
   // Ultrasonic Pins
@@ -93,22 +95,27 @@ void initPins() {
   pinMode(PIN_ECHO, INPUT);
   digitalWrite(PIN_TRIG, LOW);
 
-  ledcAttach(PIN_FAN_ENABLE, 25000, 8);
+  // Servo Setup
+  fanServo.attach(PIN_SERVO_FAN);
 
+  // Initial State: Relays OFF & Servo 0 degree
   digitalWrite(PIN_RELAY_LIGHT, LOW);
   digitalWrite(PIN_RELAY_PUMP,  LOW);
   digitalWrite(PIN_RELAY_HUMID, LOW);
-  ledcWrite(PIN_FAN_ENABLE, 0);
+  digitalWrite(PIN_RELAY_FAN,   LOW);
+  fanServo.write(0);
 
   dht.begin();
 }
 
-void applyFanPwm() {
-  if (!gDevices.fan || gDevices.fanSpeed == 0) {
-    ledcWrite(PIN_FAN_ENABLE, 0);
+void applyFanServo() {
+  if (!gDevices.fan) {
+    fanServo.write(0); // ফ্যান অফ থাকলে সার্ভো ০ ডিগ্রিতে যাবে
   } else {
-    if (gDevices.fanSpeed > 4) gDevices.fanSpeed = 4;
-    ledcWrite(PIN_FAN_ENABLE, FAN_DUTY[gDevices.fanSpeed]);
+    // স্পিড ০-৪ কে ০-১৮০ ডিগ্রিতে কনভার্ট করা (ফুল স্পিড ৪ = ১৮০ ডিগ্রি)
+    uint8_t spd = constrain(gDevices.fanSpeed, 0, 4);
+    int angle = map(spd, 0, 4, 0, 180);
+    fanServo.write(angle);
   }
 }
 
@@ -116,7 +123,9 @@ void applyDevicesToHw() {
   digitalWrite(PIN_RELAY_LIGHT, gDevices.light ? HIGH : LOW);
   digitalWrite(PIN_RELAY_PUMP,  gDevices.pump  ? HIGH : LOW);
   digitalWrite(PIN_RELAY_HUMID, gDevices.humidifier ? HIGH : LOW);
-  applyFanPwm();
+  digitalWrite(PIN_RELAY_FAN,   gDevices.fan ? HIGH : LOW);
+  
+  applyFanServo();
 }
 
 // ===========================================================================
@@ -175,16 +184,13 @@ void publishSensors(const SensorState& s) {
 // ===========================================================================
 // AUTOMATION LOGIC
 // ===========================================================================
-// ===========================================================================
-// AUTOMATION LOGIC
-// ===========================================================================
 void handleAutomation() {
   // Fan automation
   if (gAutomation.autoFan && !gDevices.fan && gSensors.temperature > 30.0) {
     gDevices.fan = true;
-    gDevices.fanSpeed = 2;
+    gDevices.fanSpeed = 4; // অটোমেটিক অন হলে ফুল স্পিড
     Firebase.setBool(fbdoAutoApply, "/devices/fan", true);
-    Firebase.setInt (fbdoAutoApply, "/devices/fan_speed", 2);
+    Firebase.setInt (fbdoAutoApply, "/devices/fan_speed", 4);
     applyDevicesToHw();
   }
   
@@ -197,13 +203,11 @@ void handleAutomation() {
   
   // Water pump automation (Hysteresis control)
   if (gAutomation.autoPump) {
-    // যদি পানির লেভেল ২০% এর নিচে নামে এবং পাম্প বন্ধ থাকে, তাহলে পাম্প চালু করো
     if (!gDevices.pump && gSensors.waterLevel < 20) {
       gDevices.pump = true;
       Firebase.setBool(fbdoAutoApply, "/devices/pump", true);
       applyDevicesToHw();
     }
-    // যদি পানির লেভেল ৯০% বা তার বেশি হয় এবং পাম্প চালু থাকে, তাহলে পাম্প বন্ধ করো
     else if (gDevices.pump && gSensors.waterLevel >= 90) {
       gDevices.pump = false;
       Firebase.setBool(fbdoAutoApply, "/devices/pump", false);
@@ -211,7 +215,7 @@ void handleAutomation() {
     }
   }
 
-  // Safety: Smoke detected shuts off pump (যেকোনো অবস্থায় ধোঁয়া দেখলে পাম্প বন্ধ)
+  // Safety: Smoke detected shuts off pump
   if (gSensors.smokeDetected && gDevices.pump) {
     gDevices.pump = false;
     Firebase.setBool(fbdoAutoApply, "/devices/pump", false);
@@ -219,21 +223,22 @@ void handleAutomation() {
   }
 }
 
+// ===========================================================================
 // TIMER LOGIC
+// ===========================================================================
 void handleTimers() {
   time_t nowSeconds = time(nullptr);
-  if (nowSeconds < 100000) return; // NTP সিংক না হওয়া পর্যন্ত অপেক্ষা 
+  if (nowSeconds < 100000) return; 
 
-  // NTP থেকে পাওয়া সেকেন্ডকে মিলি-সেকেন্ডে কনভার্ট করা (কারণ ফায়ারবেসের ডাটা মিলি-সেকেন্ডে)
   uint64_t currentMillis = (uint64_t)nowSeconds * 1000ULL; 
 
   // Light Timer Check
   if (gTimers.lightOffTime > 0 && currentMillis >= gTimers.lightOffTime) {
     gDevices.light = false;
-    gTimers.lightOffTime = 0; // টাইমার রিসেট
-    Firebase.setBool(fbdoAutoApply, "/devices/light", false); // অ্যাপে লাইট অফ দেখানোর জন্য
-    Firebase.setInt(fbdoAutoApply, "/timers/light_off_time", 0); // ফায়ারবেসে টাইমার জিরো করা
-    applyDevicesToHw(); // হার্ডওয়্যার রিলে অফ করা
+    gTimers.lightOffTime = 0;
+    Firebase.setBool(fbdoAutoApply, "/devices/light", false);
+    Firebase.setInt(fbdoAutoApply, "/timers/light_off_time", 0);
+    applyDevicesToHw();
     Serial.println("[timer] Light turned OFF via timer.");
   }
 
@@ -271,6 +276,15 @@ void handleTimers() {
 // ===========================================================================
 // STREAMS & CALLBACKS
 // ===========================================================================
+bool parseBoolData(FirebaseJsonData& result) {
+  if (result.typeNum == FirebaseJson::JSON_BOOL)   return result.boolValue;
+  if (result.typeNum == FirebaseJson::JSON_INT)    return result.intValue != 0;
+  String str = result.stringValue;
+  str.toLowerCase();
+  str.trim();
+  return (str == "true" || str == "1");
+}
+
 void startStreams() {
   if (!Firebase.ready()) return;
 
@@ -298,44 +312,35 @@ void startStreams() {
 }
 
 void onDevicesStream(StreamData data) {
-  String path = data.dataPath(); // যেমন: "/light", "/fan", ইত্যাদি
-  String type = data.dataType(); // "json", "boolean", "int"
+  String path = data.dataPath();
+  String type = data.dataType();
 
-  // ১. পুরো JSON আসলে (প্রথম কানেকশনে)
   if (type == "json") {
     FirebaseJson json = data.to<FirebaseJson>();
     FirebaseJsonData result;
-    bool tmp;
 
-    if (json.get(result, "light",      tmp)) gDevices.light      = tmp;
-    if (json.get(result, "fan",        tmp)) gDevices.fan        = tmp;
-    if (json.get(result, "pump",       tmp)) gDevices.pump       = tmp;
-    if (json.get(result, "humidifier", tmp)) gDevices.humidifier = tmp;
+    if (json.get(result, "light"))      gDevices.light      = parseBoolData(result);
+    if (json.get(result, "fan"))        gDevices.fan        = parseBoolData(result);
+    if (json.get(result, "pump"))       gDevices.pump       = parseBoolData(result);
+    if (json.get(result, "humidifier")) gDevices.humidifier = parseBoolData(result);
 
-    int speed;
-    if (json.get(result, "fan_speed", speed)) {
-      gDevices.fanSpeed = (uint8_t)constrain(speed, 0, 4);
+    if (json.get(result, "fan_speed")) {
+      gDevices.fanSpeed = (uint8_t)constrain(result.to<int>(), 0, 4);
     }
   } 
-  // ২. অ্যাপ থেকে একটি সিঙ্গেল সুইচ পরিবর্তন করলে (Boolean)
-  else if (type == "boolean") {
-    bool val = data.boolData();
-    if (path == "/light")           gDevices.light      = val;
-    else if (path == "/fan")        gDevices.fan        = val;
-    else if (path == "/pump")       gDevices.pump       = val;
-    else if (path == "/humidifier") gDevices.humidifier = val;
-  } 
-  // ৩. ফ্যান স্পিড ইত্যাদি পরিবর্তন করলে (Int)
-  else if (type == "int") {
-    int val = data.intData();
-    if (path == "/fan_speed")       gDevices.fanSpeed   = (uint8_t)constrain(val, 0, 4);
-    else if (path == "/light")      gDevices.light      = (val == 1);
-    else if (path == "/fan")        gDevices.fan        = (val == 1);
-    else if (path == "/pump")       gDevices.pump       = (val == 1);
-    else if (path == "/humidifier") gDevices.humidifier = (val == 1);
+  else {
+    String payload = data.payload();
+    payload.toLowerCase();
+    payload.trim();
+    bool boolVal = (payload == "true" || payload == "1");
+
+    if (path == "/light")           gDevices.light      = boolVal;
+    else if (path == "/fan")        gDevices.fan        = boolVal;
+    else if (path == "/pump")       gDevices.pump       = boolVal;
+    else if (path == "/humidifier") gDevices.humidifier = boolVal;
+    else if (path == "/fan_speed")  gDevices.fanSpeed   = (uint8_t)constrain(payload.toInt(), 0, 4);
   }
 
-  // হার্ডওয়্যার রিলে/PWM আপডেট করা
   applyDevicesToHw();
   Serial.printf("[stream] /devices -> Light:%d Fan:%d (Spd:%d) Pump:%d Humid:%d\n",
                 gDevices.light, gDevices.fan, gDevices.fanSpeed, gDevices.pump, gDevices.humidifier);
@@ -348,17 +353,20 @@ void onAutomationStream(StreamData data) {
   if (type == "json") {
     FirebaseJson json = data.to<FirebaseJson>();
     FirebaseJsonData result;
-    bool tmp;
 
-    if (json.get(result, "auto_fan",        tmp)) gAutomation.autoFan        = tmp;
-    if (json.get(result, "auto_humidifier", tmp)) gAutomation.autoHumidifier = tmp;
-    if (json.get(result, "auto_pump",       tmp)) gAutomation.autoPump       = tmp;
+    if (json.get(result, "auto_fan"))        gAutomation.autoFan        = parseBoolData(result);
+    if (json.get(result, "auto_humidifier")) gAutomation.autoHumidifier = parseBoolData(result);
+    if (json.get(result, "auto_pump"))       gAutomation.autoPump       = parseBoolData(result);
   } 
-  else if (type == "boolean") {
-    bool val = data.boolData();
-    if (path == "/auto_fan")             gAutomation.autoFan        = val;
-    else if (path == "/auto_humidifier") gAutomation.autoHumidifier = val;
-    else if (path == "/auto_pump")       gAutomation.autoPump       = val;
+  else {
+    String payload = data.payload();
+    payload.toLowerCase();
+    payload.trim();
+    bool boolVal = (payload == "true" || payload == "1");
+
+    if (path == "/auto_fan")             gAutomation.autoFan        = boolVal;
+    else if (path == "/auto_humidifier") gAutomation.autoHumidifier = boolVal;
+    else if (path == "/auto_pump")       gAutomation.autoPump       = boolVal;
   }
 
   Serial.printf("[stream] /automation -> AutoFan:%d AutoHumid:%d AutoPump:%d\n",
@@ -378,12 +386,12 @@ void onTimersStream(StreamData data) {
     if (json.get(result, "light_off_time"))      gTimers.lightOffTime      = result.to<uint64_t>();
     if (json.get(result, "pump_off_time"))       gTimers.pumpOffTime       = result.to<uint64_t>();
   } 
-  else if (type == "int" || type == "double") {
-    uint64_t val = data.intData(); // 13-digit Unix timestamp
-    if (path == "/fan_off_time")        gTimers.fanOffTime        = val;
+  else {
+    uint64_t val = strtoull(data.payload().c_str(), NULL, 10);
+    if (path == "/fan_off_time")             gTimers.fanOffTime        = val;
     else if (path == "/humidifier_off_time") gTimers.humidifierOffTime = val;
-    else if (path == "/light_off_time") gTimers.lightOffTime      = val;
-    else if (path == "/pump_off_time")  gTimers.pumpOffTime       = val;
+    else if (path == "/light_off_time")      gTimers.lightOffTime      = val;
+    else if (path == "/pump_off_time")       gTimers.pumpOffTime       = val;
   }
 
   Serial.println("[stream] /timers updated.");
@@ -412,7 +420,7 @@ void setup() {
   }
   Serial.printf("\nConnected! IP: %s\n", WiFi.localIP().toString().c_str());
 
-  // ২. NTP Time Sync (Email/Password Auth এর জন্য আবশ্যক)
+  // ২. NTP Time Sync
   configTime(0, 0, "pool.ntp.org", "time.nist.gov");
   Serial.print("Waiting for NTP time sync...");
   time_t now = time(nullptr);
@@ -440,7 +448,7 @@ void setup() {
   fbdoAutoApply.setBSSLBufferSize(2048, 512);
   fbdoDevices.setBSSLBufferSize(2048, 512);
   fbdoAutomation.setBSSLBufferSize(2048, 512);
-   fbdoTimers.setBSSLBufferSize(2048, 512);
+  fbdoTimers.setBSSLBufferSize(2048, 512);
 
   #if defined(USE_INSECURE_TLS) && USE_INSECURE_TLS
     config.cert.data = nullptr;
@@ -458,7 +466,7 @@ void loop() {
       startStreams();
     }
 
-    // প্রতি ৫ সেকেন্ড পর পর সেন্সর রিড ও ডাটা পাবলিশ
+    // প্রতি ৫ সেকেন্ড পর পর সেন্সর রিড, অটোমেশন, টাইমার চেক ও ডাটা পাবলিশ
     if (millis() - gLastSensorPublish > SENSOR_PERIOD_MS || gLastSensorPublish == 0) {
       gLastSensorPublish = millis();
 
