@@ -60,39 +60,45 @@ class AutomationState {
   final bool autoFan;
   final bool autoHumidifier;
   final bool autoPump;
+  final bool autoLight;
 
   const AutomationState({
     this.autoFan = true,
     this.autoHumidifier = true,
     this.autoPump = true,
+    this.autoLight = false,
   });
 
-  factory AutomationState.fromMap(Map<dynamic, dynamic>? map) {
-    final m = map ?? const {};
+  factory AutomationState.fromMap(Map<dynamic, dynamic>? m) {
+    if (m == null) return const AutomationState();
     return AutomationState(
       autoFan: m['auto_fan'] as bool? ?? true,
       autoHumidifier: m['auto_humidifier'] as bool? ?? true,
       autoPump: m['auto_pump'] as bool? ?? true,
+      autoLight: m['auto_light'] as bool? ?? false,
     );
   }
-
-  Map<String, dynamic> toMap() => {
-    'auto_fan': autoFan,
-    'auto_humidifier': autoHumidifier,
-    'auto_pump': autoPump,
-  };
 
   AutomationState copyWith({
     bool? autoFan,
     bool? autoHumidifier,
     bool? autoPump,
+    bool? autoLight,
   }) {
     return AutomationState(
       autoFan: autoFan ?? this.autoFan,
       autoHumidifier: autoHumidifier ?? this.autoHumidifier,
       autoPump: autoPump ?? this.autoPump,
+      autoLight: autoLight ?? this.autoLight,
     );
   }
+
+  Map<String, dynamic> toMap() => {
+        'auto_fan': autoFan,
+        'auto_humidifier': autoHumidifier,
+        'auto_pump': autoPump,
+        'auto_light': autoLight,
+      };
 }
 
 class SensorState {

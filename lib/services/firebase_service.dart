@@ -92,11 +92,13 @@ class FirebaseService {
     bool? autoFan,
     bool? autoHumidifier,
     bool? autoPump,
+    bool? autoLight,
   }) async {
     final updates = <String, dynamic>{};
     if (autoFan != null) updates['auto_fan'] = autoFan;
     if (autoHumidifier != null) updates['auto_humidifier'] = autoHumidifier;
     if (autoPump != null) updates['auto_pump'] = autoPump;
+    if (autoLight != null) updates['auto_light'] = autoLight;
     if (updates.isEmpty) return;
     try {
       await _automationRef.update(updates);
@@ -142,6 +144,7 @@ class FirebaseService {
     'automation/auto_fan',
     'automation/auto_humidifier',
     'automation/auto_pump',
+    'automation/auto_light',
     'timers/light_off_time',
     'timers/fan_off_time',
     'timers/pump_off_time',

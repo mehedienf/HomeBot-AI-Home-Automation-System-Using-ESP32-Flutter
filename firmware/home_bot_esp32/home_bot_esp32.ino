@@ -1,5 +1,5 @@
 // ============================================================================
-// HomeBot - ESP32 Firmware (Updated with Fan Relay & Servo Speed Control)
+// HomeBot - ESP32 Firmware (With Digital LDR, Fan Relay & Servo Speed Control)
 // ============================================================================
 
 #include <Arduino.h>
@@ -10,7 +10,7 @@
 #include <addons/TokenHelper.h>
 #include <addons/RTDBHelper.h>
 #include <DHT.h>
-#include <ESP32Servo.h> // ESP32 Servo Library
+#include <ESP32Servo.h>
 
 #include "secrets.h"
 #include "firebase_certs.h"
@@ -22,7 +22,8 @@
 #define PIN_RELAY_FAN       25      // Fan ON/OFF Relay
 #define PIN_SERVO_FAN       18      // Servo Signal Pin for Fan Speed
 #define PIN_DHT             4
-#define PIN_SMOKE           34      // analog
+#define PIN_SMOKE           34      // Analog
+#define PIN_LDR             33      // Digital LDR Sensor Pin (D0)
 #define PIN_ECHO            35      // Ultrasonic Echo (Input)
 #define PIN_TRIG            32      // Ultrasonic Trig (Output)
 
@@ -41,8 +42,8 @@ Servo fanServo;
 // STATE STRUCTS
 // ===========================================================================
 struct DeviceState     { bool light, fan, pump, humidifier; uint8_t fanSpeed; };
-struct AutomationState { bool autoFan, autoHumidifier, autoPump; };
-struct SensorState     { float temperature, humidity; uint8_t waterLevel; bool smokeDetected; int smokeRaw; };
+struct AutomationState { bool autoFan, autoHumidifier, autoPump, autoLight; };
+struct SensorState     { float temperature, humidity; uint8_t waterLevel; bool smokeDetected; int smokeRaw; int lightState; };
 struct TimerState { 
   uint64_t fanOffTime; 
   uint64_t humidifierOffTime; 
@@ -52,8 +53,8 @@ struct TimerState {
 
 TimerState      gTimers     = {0, 0, 0, 0};
 DeviceState     gDevices    = { false, false, false, false, 0 };
-AutomationState gAutomation = { true, true, true };
-SensorState     gSensors    = { 0.0, 0.0, 0, false, 0 };
+AutomationState gAutomation = { true, true, true, true };
+SensorState     gSensors    = { 0.0, 0.0, 0, false, 0, 0 };
 
 // ===========================================================================
 // FIREBASE & INSTANCES
@@ -89,6 +90,7 @@ void initPins() {
   pinMode(PIN_RELAY_HUMID, OUTPUT);
   pinMode(PIN_RELAY_FAN,   OUTPUT);
   pinMode(PIN_SMOKE,       INPUT);
+  pinMode(PIN_LDR,         INPUT);  // Digital Input for LDR D0
   
   // Ultrasonic Pins
   pinMode(PIN_TRIG, OUTPUT);
@@ -140,9 +142,10 @@ SensorState readSensors() {
   if (!isnan(t)) s.temperature = t;
   if (!isnan(h)) s.humidity    = h;
 
-  // Smoke Sensor
+  // Smoke Sensor & Digital LDR Sensor Reading
   s.smokeRaw      = analogRead(PIN_SMOKE);
   s.smokeDetected = s.smokeRaw > 1500;
+  s.lightState    = digitalRead(PIN_LDR); // LDR Digital Read (HIGH/LOW)
 
   // Ultrasonic Water Level Reading
   digitalWrite(PIN_TRIG, LOW);
@@ -154,8 +157,6 @@ SensorState readSensors() {
   long duration = pulseIn(PIN_ECHO, HIGH, 30000); // 30ms timeout 
   if (duration > 0) {
     float distance_cm = duration * 0.034 / 2.0;
-    
-    // Convert distance to percentage (0% - 100%)
     int level = map((int)distance_cm, TANK_DEPTH_CM, TANK_FULL_GAP_CM, 0, 100);
     s.waterLevel = (uint8_t)constrain(level, 0, 100);
   } else {
@@ -172,10 +173,11 @@ void publishSensors(const SensorState& s) {
   ok &= Firebase.setInt  (fbdoSensors, "/sensors/water_level",     s.waterLevel);
   ok &= Firebase.setBool (fbdoSensors, "/sensors/smoke_detected", s.smokeDetected);
   ok &= Firebase.setInt  (fbdoSensors, "/sensors/smoke_raw",       s.smokeRaw);
+  ok &= Firebase.setInt  (fbdoSensors, "/sensors/light_state",     s.lightState);
 
   if (ok) {
-    Serial.printf("[publish] Sensors updated -> T:%.1f°C, H:%.1f%%, Water:%d%%\n", 
-                  s.temperature, s.humidity, s.waterLevel);
+    Serial.printf("[publish] Sensors updated -> T:%.1f°C, H:%.1f%%, Water:%d%%, LightState:%d\n", 
+                  s.temperature, s.humidity, s.waterLevel, s.lightState);
   } else {
     Serial.printf("[publish] /sensors FAIL: %s\n", fbdoSensors.errorReason().c_str());
   }
@@ -185,23 +187,42 @@ void publishSensors(const SensorState& s) {
 // AUTOMATION LOGIC
 // ===========================================================================
 void handleAutomation() {
-  // Fan automation
+  // Light Automation (Digital LDR)
+  if (gAutomation.autoLight) {
+    // সাধারণত LDR মডিউলে অন্ধকার হলে D0 = HIGH হয়
+    bool isDark = (gSensors.lightState == HIGH);
+
+    if (!gDevices.light && isDark) {
+      gDevices.light = true;
+      Firebase.setBool(fbdoAutoApply, "/devices/light", true);
+      applyDevicesToHw();
+      Serial.println("[auto] Room is dark -> Light turned ON");
+    }
+    else if (gDevices.light && !isDark) {
+      gDevices.light = false;
+      Firebase.setBool(fbdoAutoApply, "/devices/light", false);
+      applyDevicesToHw();
+      Serial.println("[auto] Room is bright -> Light turned OFF");
+    }
+  }
+
+  // Fan Automation
   if (gAutomation.autoFan && !gDevices.fan && gSensors.temperature > 30.0) {
     gDevices.fan = true;
-    gDevices.fanSpeed = 4; // অটোমেটিক অন হলে ফুল স্পিড
+    gDevices.fanSpeed = 4;
     Firebase.setBool(fbdoAutoApply, "/devices/fan", true);
     Firebase.setInt (fbdoAutoApply, "/devices/fan_speed", 4);
     applyDevicesToHw();
   }
   
-  // Humidifier automation
+  // Humidifier Automation
   if (gAutomation.autoHumidifier && !gDevices.humidifier && gSensors.humidity < 35.0) {
     gDevices.humidifier = true;
     Firebase.setBool(fbdoAutoApply, "/devices/humidifier", true);
     applyDevicesToHw();
   }
   
-  // Water pump automation (Hysteresis control)
+  // Water Pump Automation
   if (gAutomation.autoPump) {
     if (!gDevices.pump && gSensors.waterLevel < 20) {
       gDevices.pump = true;
@@ -357,6 +378,7 @@ void onAutomationStream(StreamData data) {
     if (json.get(result, "auto_fan"))        gAutomation.autoFan        = parseBoolData(result);
     if (json.get(result, "auto_humidifier")) gAutomation.autoHumidifier = parseBoolData(result);
     if (json.get(result, "auto_pump"))       gAutomation.autoPump       = parseBoolData(result);
+    if (json.get(result, "auto_light"))      gAutomation.autoLight      = parseBoolData(result);
   } 
   else {
     String payload = data.payload();
@@ -367,10 +389,11 @@ void onAutomationStream(StreamData data) {
     if (path == "/auto_fan")             gAutomation.autoFan        = boolVal;
     else if (path == "/auto_humidifier") gAutomation.autoHumidifier = boolVal;
     else if (path == "/auto_pump")       gAutomation.autoPump       = boolVal;
+    else if (path == "/auto_light")      gAutomation.autoLight      = boolVal;
   }
 
-  Serial.printf("[stream] /automation -> AutoFan:%d AutoHumid:%d AutoPump:%d\n",
-                gAutomation.autoFan, gAutomation.autoHumidifier, gAutomation.autoPump);
+  Serial.printf("[stream] /automation -> AutoFan:%d AutoHumid:%d AutoPump:%d AutoLight:%d\n",
+                gAutomation.autoFan, gAutomation.autoHumidifier, gAutomation.autoPump, gAutomation.autoLight);
 }
 
 void onTimersStream(StreamData data) {

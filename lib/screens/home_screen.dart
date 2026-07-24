@@ -219,6 +219,13 @@ class _HomeScreenState extends State<HomeScreen> {
                         const SizedBox(height: 20),
                         _SectionLabel('Automation'),
                         _AutomationTile(
+                          title: 'Auto Light',
+                          subtitle: 'On when room is dark',
+                          icon: Icons.lightbulb,
+                          value: state.autoLight,
+                          onChanged: state.setAutoLight,
+                        ),
+                        _AutomationTile(
                           title: 'Auto Fan',
                           subtitle: 'Speed up when it gets hot',
                           icon: Icons.air,

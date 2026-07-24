@@ -116,6 +116,10 @@ class HomeStateController extends ChangeNotifier {
     return _snapshot.automation.autoPump;
   }
 
+  bool get autoLight {
+    return _snapshot.automation.autoLight;
+  }
+
   double get temperature {
     return _snapshot.sensors.temperature;
   }
@@ -201,6 +205,15 @@ class HomeStateController extends ChangeNotifier {
       await _firebase.setAutomationFlag(autoPump: v);
     } catch (e) {
       _lastError = 'setAutoPump: $e';
+      notifyListeners();
+    }
+  }
+
+  Future<void> setAutoLight(bool v) async {
+    try {
+      await _firebase.setAutomationFlag(autoLight: v);
+    } catch (e) {
+      _lastError = 'setAutoLight: $e';
       notifyListeners();
     }
   }
