@@ -8,7 +8,7 @@
 class DeviceState {
   final bool light;
   final bool fan;
-  final int fanSpeed; // 0..4
+  final int fanSpeed; // 0..255 (raw PWM duty sent to ESP32)
   final bool pump;
   final bool humidifier;
 

@@ -96,6 +96,12 @@ class HomeStateController extends ChangeNotifier {
     return _snapshot.devices.fanSpeed;
   }
 
+  /// Fan speed as 0..100 percent (0..255 raw rounded to nearest integer).
+  int get fanSpeedPercent {
+    final raw = _snapshot.devices.fanSpeed.clamp(0, 255);
+    return (raw * 100 / 255).round();
+  }
+
   bool get pump {
     return _snapshot.devices.pump;
   }
@@ -178,6 +184,25 @@ class HomeStateController extends ChangeNotifier {
       await _firebase.setFanSpeed(v);
     } catch (e) {
       _lastError = 'setFanSpeed: $e';
+      notifyListeners();
+    }
+  }
+
+  /// Set fan speed from a 0..100 percent slider value. Internally writes the
+  /// corresponding 0..255 raw value to `/devices/fan_speed` and toggles the
+  /// fan on automatically when percent > 0 (off when percent == 0).
+  Future<void> setFanSpeedPct(int pct) async {
+    final p = pct.clamp(0, 100);
+    final raw = (p * 255 / 100).round().clamp(0, 255);
+    try {
+      await _firebase.setFanSpeed(raw);
+      // Auto-toggle fan on/off based on percent.
+      final wantFan = raw > 0;
+      if (wantFan != _snapshot.devices.fan) {
+        await _firebase.setDevice(fan: wantFan);
+      }
+    } catch (e) {
+      _lastError = 'setFanSpeedPct: $e';
       notifyListeners();
     }
   }

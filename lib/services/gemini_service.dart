@@ -163,7 +163,7 @@ class GeminiService {
       ..writeln('ALLOWED FIREBASE PATHS AND VALUE TYPES:')
       ..writeln('  devices/light             : boolean  (true = ON, false = OFF)')
       ..writeln('  devices/fan               : boolean')
-      ..writeln('  devices/fan_speed         : integer  (0..4, 0 = off)')
+      ..writeln('  devices/fan_speed         : integer  (0..255, 0 = off)')
       ..writeln('  devices/pump              : boolean')
       ..writeln('  devices/humidifier        : boolean')
       ..writeln('  automation/auto_fan       : boolean')
@@ -397,7 +397,7 @@ class GeminiService {
         case 'timers/pump_off_time':
         case 'timers/humidifier_off_time':
           final n = (value is num) ? value.toInt() : int.tryParse(value.toString()) ?? 0;
-          dbUpdate[k] = (k == 'devices/fan_speed') ? n.clamp(0, 4) : n;
+          dbUpdate[k] = (k == 'devices/fan_speed') ? n.clamp(0, 255) : n;
           break;
         default:
           // Unknown path - silently drop to avoid corrupting the DB.

@@ -77,9 +77,9 @@ class FirebaseService {
     }
   }
 
-  /// fanSpeed is a discrete 0..4 integer that maps to the ESP32 PWM duty.
+  /// fanSpeed is a 0..255 integer (raw PWM duty) sent to the ESP32.
   Future<void> setFanSpeed(int speed) async {
-    final clamped = speed.clamp(0, 4);
+    final clamped = speed.clamp(0, 255);
     try {
       await _devicesRef.update({'fan_speed': clamped});
     } catch (e, st) {

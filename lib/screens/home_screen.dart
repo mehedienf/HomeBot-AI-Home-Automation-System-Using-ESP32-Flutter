@@ -71,22 +71,29 @@ class _HomeScreenState extends State<HomeScreen> {
     return Scaffold(
       backgroundColor: const Color(0xFFF4F6FA),
       appBar: AppBar(
-        title: const Text('Home Dashboard'),
+        title: const Column(
+          crossAxisAlignment: .start,
+          children: [
+            Text('HomeBot'),
+            Text('Patuakhali Science and Technology University', style: TextStyle(fontSize: 13),)
+          ],
+        ),
         elevation: 0,
         backgroundColor: Colors.transparent,
         foregroundColor: Colors.black87,
-        actions: [
-          IconButton(
-            tooltip: 'Reset alert',
-            icon: const Icon(Icons.refresh),
-            onPressed: () {
-              setState(() {
-                _alertDismissed = false;
-              });
-            },
-          ),
-        ],
+        // actions: [
+        //   IconButton(
+        //     tooltip: 'Reset alert',
+        //     icon: const Icon(Icons.refresh),
+        //     onPressed: () {
+        //       setState(() {
+        //         _alertDismissed = false;
+        //       });
+        //     },
+        //   ),
+        // ],
       ),
+      
       floatingActionButton: FloatingActionButton.extended(
         onPressed: () {
           Navigator.of(context).push(
@@ -96,7 +103,7 @@ class _HomeScreenState extends State<HomeScreen> {
           );
         },
         icon: const Icon(Icons.smart_toy),
-        label: const Text('AI Assistant'),
+        label: const Text('HomeBot AI'),
       ),
       body: Column(
         children: [
@@ -208,12 +215,9 @@ class _HomeScreenState extends State<HomeScreen> {
                           },
                         ),
                         FanSpeedControl(
-                          speed: state.fanSpeed,
-                          onChanged: (v) async {
-                            await state.setFanSpeed(v);
-                            if (v > 0 && !state.fan) {
-                              await state.setFan(true);
-                            }
+                          percent: state.fanSpeedPercent,
+                          onChanged: (pct) async {
+                            await state.setFanSpeedPct(pct);
                           },
                         ),
                         const SizedBox(height: 20),

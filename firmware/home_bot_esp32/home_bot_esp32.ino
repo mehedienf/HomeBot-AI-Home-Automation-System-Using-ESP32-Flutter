@@ -1,5 +1,5 @@
 // ============================================================================
-// HomeBot - ESP32 Firmware (With Digital LDR, Fan Relay & Servo Speed Control)
+// HomeBot - ESP32 Firmware (Configurable Thresholds, Dynamic Fan Speed & Relays)
 // ============================================================================
 
 #include <Arduino.h>
@@ -21,11 +21,26 @@
 #define PIN_RELAY_HUMID     14
 #define PIN_RELAY_FAN       25      // Fan ON/OFF Relay
 #define PIN_SERVO_FAN       18      // Servo Signal Pin for Fan Speed
+#define PIN_BUZZER          19      // Buzzer Pin for Smoke Alarm
 #define PIN_DHT             4
 #define PIN_SMOKE           34      // Analog
 #define PIN_LDR             33      // Digital LDR Sensor Pin (D0)
 #define PIN_ECHO            35      // Ultrasonic Echo (Input)
 #define PIN_TRIG            32      // Ultrasonic Trig (Output)
+
+// ============================================================================
+// AUTOMATION THRESHOLDS (এখান থেকে সহজে পরিবর্তন করতে পারবেন)
+// ============================================================================
+#define TEMP_FAN_ON          27.0  // কত °C তাপমাত্রায় ফ্যান চালু হবে (মিনিমাম স্পিডে)
+#define TEMP_FAN_MAX         32.0  // কত °C তাপমাত্রায় ফ্যান ফুল স্পিডে (২৫৫) চলবে
+#define TEMP_FAN_OFF         26.0  // কত °C তাপমাত্রার নিচে নামলে ফ্যান ও রিলে একদম অফ হয়ে যাবে
+
+#define HUMID_HUMIDIFIER_ON  40.0  // আর্দ্রতা কত % এর নিচে নামলে হিউমিডিফায়ার অন হবে
+#define HUMID_HUMIDIFIER_OFF 50.0  // আর্দ্রতা কত % এর উপরে উঠলে হিউমিডিফায়ার অফ হবে
+
+// Relay Active Logic (আপনার রিলে Active High নাকি Active Low তা এখান থেকে চেঞ্জ করতে পারবেন)
+#define RELAY_ON             LOW
+#define RELAY_OFF            HIGH
 
 // Timing (milliseconds)
 #define SENSOR_PERIOD_MS    5000    // publish sensors every 5s
@@ -89,6 +104,7 @@ void initPins() {
   pinMode(PIN_RELAY_PUMP,  OUTPUT);
   pinMode(PIN_RELAY_HUMID, OUTPUT);
   pinMode(PIN_RELAY_FAN,   OUTPUT);
+  pinMode(PIN_BUZZER,      OUTPUT);
   pinMode(PIN_SMOKE,       INPUT);
   pinMode(PIN_LDR,         INPUT);  // Digital Input for LDR D0
   
@@ -100,11 +116,12 @@ void initPins() {
   // Servo Setup
   fanServo.attach(PIN_SERVO_FAN);
 
-  // Initial State: Relays OFF & Servo 0 degree
-  digitalWrite(PIN_RELAY_LIGHT, LOW);
-  digitalWrite(PIN_RELAY_PUMP,  LOW);
-  digitalWrite(PIN_RELAY_HUMID, LOW);
-  digitalWrite(PIN_RELAY_FAN,   LOW);
+  // Initial State: All Relays & Buzzer OFF, Servo 0 degree
+  digitalWrite(PIN_RELAY_LIGHT, RELAY_OFF);
+  digitalWrite(PIN_RELAY_PUMP,  RELAY_OFF);
+  digitalWrite(PIN_RELAY_HUMID, RELAY_OFF);
+  digitalWrite(PIN_RELAY_FAN,   RELAY_OFF);
+  digitalWrite(PIN_BUZZER,      LOW);
   fanServo.write(0);
 
   dht.begin();
@@ -114,18 +131,19 @@ void applyFanServo() {
   if (!gDevices.fan) {
     fanServo.write(0); // ফ্যান অফ থাকলে সার্ভো ০ ডিগ্রিতে যাবে
   } else {
-    // স্পিড ০-৪ কে ০-১৮০ ডিগ্রিতে কনভার্ট করা (ফুল স্পিড ৪ = ১৮০ ডিগ্রি)
-    uint8_t spd = constrain(gDevices.fanSpeed, 0, 4);
-    int angle = map(spd, 0, 4, 0, 180);
+    // App বা Auto logic থেকে ০-২৫৫ raw PWM duty আসে, সার্ভো ০-১৮০° তে ম্যাপ হয়
+    uint8_t spd = constrain(gDevices.fanSpeed, 0, 255);
+    int angle = map(spd, 0, 255, 0, 180);
     fanServo.write(angle);
   }
 }
 
 void applyDevicesToHw() {
-  digitalWrite(PIN_RELAY_LIGHT, gDevices.light ? HIGH : LOW);
-  digitalWrite(PIN_RELAY_PUMP,  gDevices.pump  ? HIGH : LOW);
-  digitalWrite(PIN_RELAY_HUMID, gDevices.humidifier ? HIGH : LOW);
-  digitalWrite(PIN_RELAY_FAN,   gDevices.fan ? HIGH : LOW);
+  // ডিভাইস অন থাকলে রিলে অন, অফ থাকলে রিলে সম্পূর্ণ অফ
+  digitalWrite(PIN_RELAY_LIGHT, gDevices.light ? RELAY_ON : RELAY_OFF);
+  digitalWrite(PIN_RELAY_PUMP,  gDevices.pump  ? RELAY_ON : RELAY_OFF);
+  digitalWrite(PIN_RELAY_HUMID, gDevices.humidifier ? RELAY_ON : RELAY_OFF);
+  digitalWrite(PIN_RELAY_FAN,   gDevices.fan ? RELAY_ON : RELAY_OFF);
   
   applyFanServo();
 }
@@ -184,12 +202,24 @@ void publishSensors(const SensorState& s) {
 }
 
 // ===========================================================================
-// AUTOMATION LOGIC
+// AUTOMATION & SAFETY LOGIC
 // ===========================================================================
 void handleAutomation() {
-  // Light Automation (Digital LDR)
+  // 1. Smoke Alarm & Safety Logic
+  if (gSensors.smokeDetected) {
+    digitalWrite(PIN_BUZZER, HIGH); // ধোঁয়া পেলেই বাজায়ার অন
+    
+    if (gDevices.pump) {
+      gDevices.pump = false;
+      Firebase.setBool(fbdoAutoApply, "/devices/pump", false);
+      applyDevicesToHw();
+    }
+  } else {
+    digitalWrite(PIN_BUZZER, LOW);  // ধোঁয়া না থাকলে বাজায়ার অফ
+  }
+
+  // 2. Light Automation (Digital LDR)
   if (gAutomation.autoLight) {
-    // সাধারণত LDR মডিউলে অন্ধকার হলে D0 = HIGH হয়
     bool isDark = (gSensors.lightState == HIGH);
 
     if (!gDevices.light && isDark) {
@@ -206,23 +236,51 @@ void handleAutomation() {
     }
   }
 
-  // Fan Automation
-  if (gAutomation.autoFan && !gDevices.fan && gSensors.temperature > 30.0) {
-    gDevices.fan = true;
-    gDevices.fanSpeed = 4;
-    Firebase.setBool(fbdoAutoApply, "/devices/fan", true);
-    Firebase.setInt (fbdoAutoApply, "/devices/fan_speed", 4);
-    applyDevicesToHw();
+  // 3. Fan Automation (Dynamic Speed based on Temperature)
+  if (gAutomation.autoFan) {
+    if (gSensors.temperature >= TEMP_FAN_ON) {
+      gDevices.fan = true;
+      
+      // তাপমাত্রা অনুযায়ী স্পিড ম্যাপ করা (TEMP_FAN_ON এ ৮০ স্পিড এবং TEMP_FAN_MAX এ ২৫৫ স্পিড)
+      float tempClamped = constrain(gSensors.temperature, TEMP_FAN_ON, TEMP_FAN_MAX);
+      int mappedSpeed = map((int)(tempClamped * 10), (int)(TEMP_FAN_ON * 10), (int)(TEMP_FAN_MAX * 10), 80, 255);
+      
+      gDevices.fanSpeed = (uint8_t)mappedSpeed;
+
+      Firebase.setBool(fbdoAutoApply, "/devices/fan", true);
+      Firebase.setInt (fbdoAutoApply, "/devices/fan_speed", gDevices.fanSpeed);
+      applyDevicesToHw();
+      Serial.printf("[auto] Temp %.1f°C -> Fan ON (Speed: %d)\n", gSensors.temperature, gDevices.fanSpeed);
+    }
+    else if (gSensors.temperature < TEMP_FAN_OFF) {
+      if (gDevices.fan) {
+        gDevices.fan = false;
+        gDevices.fanSpeed = 0;
+        Firebase.setBool(fbdoAutoApply, "/devices/fan", false);
+        Firebase.setInt (fbdoAutoApply, "/devices/fan_speed", 0);
+        applyDevicesToHw();
+        Serial.println("[auto] Temp low -> Fan & Relay turned OFF");
+      }
+    }
   }
   
-  // Humidifier Automation
-  if (gAutomation.autoHumidifier && !gDevices.humidifier && gSensors.humidity < 35.0) {
-    gDevices.humidifier = true;
-    Firebase.setBool(fbdoAutoApply, "/devices/humidifier", true);
-    applyDevicesToHw();
+  // 4. Humidifier Automation (Humidity Based)
+  if (gAutomation.autoHumidifier) {
+    if (!gDevices.humidifier && gSensors.humidity < HUMID_HUMIDIFIER_ON) {
+      gDevices.humidifier = true;
+      Firebase.setBool(fbdoAutoApply, "/devices/humidifier", true);
+      applyDevicesToHw();
+      Serial.println("[auto] Humidity low -> Humidifier turned ON");
+    }
+    else if (gDevices.humidifier && gSensors.humidity >= HUMID_HUMIDIFIER_OFF) {
+      gDevices.humidifier = false;
+      Firebase.setBool(fbdoAutoApply, "/devices/humidifier", false);
+      applyDevicesToHw();
+      Serial.println("[auto] Humidity normal -> Humidifier turned OFF");
+    }
   }
   
-  // Water Pump Automation
+  // 5. Water Pump Automation
   if (gAutomation.autoPump) {
     if (!gDevices.pump && gSensors.waterLevel < 20) {
       gDevices.pump = true;
@@ -234,13 +292,6 @@ void handleAutomation() {
       Firebase.setBool(fbdoAutoApply, "/devices/pump", false);
       applyDevicesToHw();
     }
-  }
-
-  // Safety: Smoke detected shuts off pump
-  if (gSensors.smokeDetected && gDevices.pump) {
-    gDevices.pump = false;
-    Firebase.setBool(fbdoAutoApply, "/devices/pump", false);
-    applyDevicesToHw();
   }
 }
 
@@ -346,9 +397,9 @@ void onDevicesStream(StreamData data) {
     if (json.get(result, "humidifier")) gDevices.humidifier = parseBoolData(result);
 
     if (json.get(result, "fan_speed")) {
-      gDevices.fanSpeed = (uint8_t)constrain(result.to<int>(), 0, 4);
+      gDevices.fanSpeed = (uint8_t)constrain(result.to<int>(), 0, 255);
     }
-  } 
+  }
   else {
     String payload = data.payload();
     payload.toLowerCase();
@@ -359,7 +410,7 @@ void onDevicesStream(StreamData data) {
     else if (path == "/fan")        gDevices.fan        = boolVal;
     else if (path == "/pump")       gDevices.pump       = boolVal;
     else if (path == "/humidifier") gDevices.humidifier = boolVal;
-    else if (path == "/fan_speed")  gDevices.fanSpeed   = (uint8_t)constrain(payload.toInt(), 0, 4);
+    else if (path == "/fan_speed")  gDevices.fanSpeed   = (uint8_t)constrain(payload.toInt(), 0, 255);
   }
 
   applyDevicesToHw();
