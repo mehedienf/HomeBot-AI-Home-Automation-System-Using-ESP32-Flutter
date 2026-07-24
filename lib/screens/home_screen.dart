@@ -177,6 +177,16 @@ class _HomeScreenState extends State<HomeScreen> {
                           },
                         ),
                         DeviceSwitchCard(
+                          name: 'Fan',
+                          icon: Icons.air,
+                          activeColor: Colors.blue,
+                          value: state.fan,
+                          onChanged: state.setFan,
+                          onSetTimer: () {
+                            _setTimerFor(DeviceId.fan, 'Fan');
+                          },
+                        ),
+                        DeviceSwitchCard(
                           name: 'Water Pump',
                           icon: Icons.opacity,
                           activeColor: Colors.indigo,
