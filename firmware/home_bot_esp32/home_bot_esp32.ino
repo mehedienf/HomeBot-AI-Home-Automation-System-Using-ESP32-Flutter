@@ -1,5 +1,5 @@
 // ============================================================================
-// HomeBot - ESP32 Firmware (Configurable Thresholds, Dynamic Fan Speed & Relays)
+// HomeBot - ESP32 Firmware (Full Code with Fixed Servo 0-180° Range)
 // ============================================================================
 
 #include <Arduino.h>
@@ -12,10 +12,24 @@
 #include <DHT.h>
 #include <ESP32Servo.h>
 
+// OLED Display Libraries
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
 #include "secrets.h"
 #include "firebase_certs.h"
 
-// Hardware pins
+// ============================================================================
+// HARDWARE & DISPLAY CONFIGURATION
+// ============================================================================
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET    -1
+#define SCREEN_ADDRESS 0x3C // 0.96" OLED I2C Address
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// Hardware Pins
 #define PIN_RELAY_LIGHT     26
 #define PIN_RELAY_PUMP      27
 #define PIN_RELAY_HUMID     14
@@ -23,32 +37,36 @@
 #define PIN_SERVO_FAN       18      // Servo Signal Pin for Fan Speed
 #define PIN_BUZZER          19      // Buzzer Pin for Smoke Alarm
 #define PIN_DHT             4
-#define PIN_SMOKE           34      // Analog
+#define PIN_SMOKE           34      // Analog Smoke Sensor
 #define PIN_LDR             33      // Digital LDR Sensor Pin (D0)
 #define PIN_ECHO            35      // Ultrasonic Echo (Input)
 #define PIN_TRIG            32      // Ultrasonic Trig (Output)
 
+// OLED I2C Pins (ESP32 Default)
+#define PIN_OLED_SDA        21
+#define PIN_OLED_SCL        22
+
 // ============================================================================
-// AUTOMATION THRESHOLDS (এখান থেকে সহজে পরিবর্তন করতে পারবেন)
+// AUTOMATION THRESHOLDS
 // ============================================================================
-#define TEMP_FAN_ON          27.0  // কত °C তাপমাত্রায় ফ্যান চালু হবে (মিনিমাম স্পিডে)
-#define TEMP_FAN_MAX         32.0  // কত °C তাপমাত্রায় ফ্যান ফুল স্পিডে (২৫৫) চলবে
-#define TEMP_FAN_OFF         26.0  // কত °C তাপমাত্রার নিচে নামলে ফ্যান ও রিলে একদম অফ হয়ে যাবে
+#define TEMP_FAN_ON          27.0  // কত °C তাপমাত্রায় ফ্যান চালু হবে
+#define TEMP_FAN_MAX         32.0  // কত °C তাপমাত্রায় ফ্যান ফুল স্পিডে (২৫৫) চলবে
+#define TEMP_FAN_OFF         26.0  // কত °C তাপমাত্রার নিচে নামলে ফ্যান সম্পূর্ণ বন্ধ হবে
 
 #define HUMID_HUMIDIFIER_ON  40.0  // আর্দ্রতা কত % এর নিচে নামলে হিউমিডিফায়ার অন হবে
 #define HUMID_HUMIDIFIER_OFF 50.0  // আর্দ্রতা কত % এর উপরে উঠলে হিউমিডিফায়ার অফ হবে
 
-// Relay Active Logic (আপনার রিলে Active High নাকি Active Low তা এখান থেকে চেঞ্জ করতে পারবেন)
+// Relay Active Logic
 #define RELAY_ON             LOW
 #define RELAY_OFF            HIGH
 
 // Timing (milliseconds)
-#define SENSOR_PERIOD_MS    5000    // publish sensors every 5s
-#define STREAM_RECONNECT_MS 30000   // restart streams every 30s safety net
+#define SENSOR_PERIOD_MS    3000    // সেন্সর ডাটা রিড ও ডিসপ্লে রিফ্রেশ টাইম (৩ সেকেন্ড)
+#define STREAM_RECONNECT_MS 20000   
 
 // Water Tank Calibration (Centimeters)
-#define TANK_DEPTH_CM       30     // সেন্সর থেকে পানির সর্বোচ্চ দূরত্ব যখন ট্যাংক খালি (0%)
-#define TANK_FULL_GAP_CM    1      // সেন্সর থেকে পানির সর্বনিম্ন দূরত্ব যখন ট্যাংক ভর্তি (100%)
+#define TANK_DEPTH_CM       12     // সেন্সর থেকে পানির সর্বোচ্চ দূরত্ব (খালি = 0%)
+#define TANK_FULL_GAP_CM    2      // সেন্সর থেকে পানির সর্বনিম্ন দূরত্ব (ভর্তি = 100%)
 
 // Servo Instance
 Servo fanServo;
@@ -89,7 +107,10 @@ bool          gStreamsStarted    = false;
 DHT dht(PIN_DHT, DHT22);
 
 // Forward Declarations
+void applyFanServo();
 void applyDevicesToHw();
+void updateDisplay();
+void startStreams();
 void onDevicesStream(StreamData data);
 void onAutomationStream(StreamData data);
 void onTimersStream(StreamData data);
@@ -106,46 +127,100 @@ void initPins() {
   pinMode(PIN_RELAY_FAN,   OUTPUT);
   pinMode(PIN_BUZZER,      OUTPUT);
   pinMode(PIN_SMOKE,       INPUT);
-  pinMode(PIN_LDR,         INPUT);  // Digital Input for LDR D0
+  pinMode(PIN_LDR,         INPUT);  
   
   // Ultrasonic Pins
   pinMode(PIN_TRIG, OUTPUT);
   pinMode(PIN_ECHO, INPUT);
   digitalWrite(PIN_TRIG, LOW);
 
-  // Servo Setup
-  fanServo.attach(PIN_SERVO_FAN);
-
-  // Initial State: All Relays & Buzzer OFF, Servo 0 degree
+  // Initial State: All Relays & Buzzer OFF
   digitalWrite(PIN_RELAY_LIGHT, RELAY_OFF);
   digitalWrite(PIN_RELAY_PUMP,  RELAY_OFF);
   digitalWrite(PIN_RELAY_HUMID, RELAY_OFF);
   digitalWrite(PIN_RELAY_FAN,   RELAY_OFF);
   digitalWrite(PIN_BUZZER,      LOW);
-  fanServo.write(0);
-
+  
+  applyFanServo(); 
   dht.begin();
 }
 
 void applyFanServo() {
-  if (!gDevices.fan) {
-    fanServo.write(0); // ফ্যান অফ থাকলে সার্ভো ০ ডিগ্রিতে যাবে
-  } else {
-    // App বা Auto logic থেকে ০-২৫৫ raw PWM duty আসে, সার্ভো ০-১৮০° তে ম্যাপ হয়
+  if (gDevices.fan && gDevices.fanSpeed > 0) {
+    // 0-180 ডিগ্রি রেঞ্জের জন্য স্ট্যান্ডার্ড পালস উইডথ (544us-2400us)
+    if (!fanServo.attached()) {
+      fanServo.attach(PIN_SERVO_FAN, 544, 2400);
+    }
+
     uint8_t spd = constrain(gDevices.fanSpeed, 0, 255);
-    int angle = map(spd, 0, 255, 0, 180);
-    fanServo.write(angle);
+    int targetAngle = map(spd, 0, 255, 0, 180); // 0 = 0°, 255 = 180°
+    fanServo.write(targetAngle);
+  } 
+  else {
+    // ফ্যান বন্ধ বা স্পিড 0 থাকলে সার্ভো 0 ডিগ্রিতে গিয়ে ডিটাচ হবে
+    if (fanServo.attached()) {
+      fanServo.write(0);
+      delay(150);
+      fanServo.detach(); // কারেন্ট ও নয়েজ বন্ধ থাকবে
+    }
   }
 }
 
 void applyDevicesToHw() {
-  // ডিভাইস অন থাকলে রিলে অন, অফ থাকলে রিলে সম্পূর্ণ অফ
+  // রিলে স্টেট প্রয়োগ
   digitalWrite(PIN_RELAY_LIGHT, gDevices.light ? RELAY_ON : RELAY_OFF);
   digitalWrite(PIN_RELAY_PUMP,  gDevices.pump  ? RELAY_ON : RELAY_OFF);
   digitalWrite(PIN_RELAY_HUMID, gDevices.humidifier ? RELAY_ON : RELAY_OFF);
   digitalWrite(PIN_RELAY_FAN,   gDevices.fan ? RELAY_ON : RELAY_OFF);
   
+  // সার্ভো কন্ট্রোল ও ডিসপ্লে রিফ্রেশ
   applyFanServo();
+  updateDisplay(); 
+}
+
+// ===========================================================================
+// OLED DISPLAY UPDATE
+// ===========================================================================
+void updateDisplay() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+
+  // Header
+  display.setCursor(18, 0);
+  display.print("--- HOMEBOT ---");
+
+  // Sensor Data Section
+  display.setCursor(0, 11);
+  display.printf("Temp: %.1fC  Hum: %.0f%%", gSensors.temperature, gSensors.humidity);
+
+  display.setCursor(0, 21);
+  display.printf("Water: %d%%   LDR: %s", gSensors.waterLevel, (gSensors.lightState == HIGH ? "Dark" : "Bright"));
+
+  display.setCursor(0, 31);
+  if (gSensors.smokeDetected) {
+    display.printf("Smoke: ALERT! (%d)", gSensors.smokeRaw);
+  } else {
+    display.printf("Smoke: SAFE (%d)", gSensors.smokeRaw);
+  }
+
+  // Horizontal Line
+  display.drawLine(0, 41, 128, 41, SSD1306_WHITE);
+
+  // Devices State Section
+  display.setCursor(0, 45);
+  display.printf("Lgt:%-3s  Hmd:%-3s", gDevices.light ? "ON" : "OFF", gDevices.humidifier ? "ON" : "OFF");
+
+  display.setCursor(0, 55);
+  if (gDevices.fan) {
+    int fanPct = map(gDevices.fanSpeed, 0, 255, 0, 100);
+    display.printf("Fan:%d%% ", fanPct);
+  } else {
+    display.print("Fan:OFF  ");
+  }
+  display.printf(" Pmp:%-3s", gDevices.pump ? "ON" : "OFF");
+
+  display.display();
 }
 
 // ===========================================================================
@@ -163,7 +238,7 @@ SensorState readSensors() {
   // Smoke Sensor & Digital LDR Sensor Reading
   s.smokeRaw      = analogRead(PIN_SMOKE);
   s.smokeDetected = s.smokeRaw > 1500;
-  s.lightState    = digitalRead(PIN_LDR); // LDR Digital Read (HIGH/LOW)
+  s.lightState    = digitalRead(PIN_LDR); 
 
   // Ultrasonic Water Level Reading
   digitalWrite(PIN_TRIG, LOW);
@@ -172,7 +247,7 @@ SensorState readSensors() {
   delayMicroseconds(10);
   digitalWrite(PIN_TRIG, LOW);
 
-  long duration = pulseIn(PIN_ECHO, HIGH, 30000); // 30ms timeout 
+  long duration = pulseIn(PIN_ECHO, HIGH, 30000); 
   if (duration > 0) {
     float distance_cm = duration * 0.034 / 2.0;
     int level = map((int)distance_cm, TANK_DEPTH_CM, TANK_FULL_GAP_CM, 0, 100);
@@ -194,8 +269,8 @@ void publishSensors(const SensorState& s) {
   ok &= Firebase.setInt  (fbdoSensors, "/sensors/light_state",     s.lightState);
 
   if (ok) {
-    Serial.printf("[publish] Sensors updated -> T:%.1f°C, H:%.1f%%, Water:%d%%, LightState:%d\n", 
-                  s.temperature, s.humidity, s.waterLevel, s.lightState);
+    Serial.printf("[publish] Sensors updated -> T:%.1f°C, H:%.1f%%, Water:%d%%\n", 
+                  s.temperature, s.humidity, s.waterLevel);
   } else {
     Serial.printf("[publish] /sensors FAIL: %s\n", fbdoSensors.errorReason().c_str());
   }
@@ -205,20 +280,19 @@ void publishSensors(const SensorState& s) {
 // AUTOMATION & SAFETY LOGIC
 // ===========================================================================
 void handleAutomation() {
-  // 1. Smoke Alarm & Safety Logic
+  // 1. Smoke Alarm & Safety
   if (gSensors.smokeDetected) {
-    digitalWrite(PIN_BUZZER, HIGH); // ধোঁয়া পেলেই বাজায়ার অন
-    
+    digitalWrite(PIN_BUZZER, HIGH); 
     if (gDevices.pump) {
       gDevices.pump = false;
       Firebase.setBool(fbdoAutoApply, "/devices/pump", false);
       applyDevicesToHw();
     }
   } else {
-    digitalWrite(PIN_BUZZER, LOW);  // ধোঁয়া না থাকলে বাজায়ার অফ
+    digitalWrite(PIN_BUZZER, LOW);  
   }
 
-  // 2. Light Automation (Digital LDR)
+  // 2. Light Automation
   if (gAutomation.autoLight) {
     bool isDark = (gSensors.lightState == HIGH);
 
@@ -226,22 +300,18 @@ void handleAutomation() {
       gDevices.light = true;
       Firebase.setBool(fbdoAutoApply, "/devices/light", true);
       applyDevicesToHw();
-      Serial.println("[auto] Room is dark -> Light turned ON");
     }
     else if (gDevices.light && !isDark) {
       gDevices.light = false;
       Firebase.setBool(fbdoAutoApply, "/devices/light", false);
       applyDevicesToHw();
-      Serial.println("[auto] Room is bright -> Light turned OFF");
     }
   }
 
-  // 3. Fan Automation (Dynamic Speed based on Temperature)
+  // 3. Fan Automation
   if (gAutomation.autoFan) {
     if (gSensors.temperature >= TEMP_FAN_ON) {
       gDevices.fan = true;
-      
-      // তাপমাত্রা অনুযায়ী স্পিড ম্যাপ করা (TEMP_FAN_ON এ ৮০ স্পিড এবং TEMP_FAN_MAX এ ২৫৫ স্পিড)
       float tempClamped = constrain(gSensors.temperature, TEMP_FAN_ON, TEMP_FAN_MAX);
       int mappedSpeed = map((int)(tempClamped * 10), (int)(TEMP_FAN_ON * 10), (int)(TEMP_FAN_MAX * 10), 80, 255);
       
@@ -250,7 +320,6 @@ void handleAutomation() {
       Firebase.setBool(fbdoAutoApply, "/devices/fan", true);
       Firebase.setInt (fbdoAutoApply, "/devices/fan_speed", gDevices.fanSpeed);
       applyDevicesToHw();
-      Serial.printf("[auto] Temp %.1f°C -> Fan ON (Speed: %d)\n", gSensors.temperature, gDevices.fanSpeed);
     }
     else if (gSensors.temperature < TEMP_FAN_OFF) {
       if (gDevices.fan) {
@@ -259,24 +328,21 @@ void handleAutomation() {
         Firebase.setBool(fbdoAutoApply, "/devices/fan", false);
         Firebase.setInt (fbdoAutoApply, "/devices/fan_speed", 0);
         applyDevicesToHw();
-        Serial.println("[auto] Temp low -> Fan & Relay turned OFF");
       }
     }
   }
   
-  // 4. Humidifier Automation (Humidity Based)
+  // 4. Humidifier Automation
   if (gAutomation.autoHumidifier) {
     if (!gDevices.humidifier && gSensors.humidity < HUMID_HUMIDIFIER_ON) {
       gDevices.humidifier = true;
       Firebase.setBool(fbdoAutoApply, "/devices/humidifier", true);
       applyDevicesToHw();
-      Serial.println("[auto] Humidity low -> Humidifier turned ON");
     }
     else if (gDevices.humidifier && gSensors.humidity >= HUMID_HUMIDIFIER_OFF) {
       gDevices.humidifier = false;
       Firebase.setBool(fbdoAutoApply, "/devices/humidifier", false);
       applyDevicesToHw();
-      Serial.println("[auto] Humidity normal -> Humidifier turned OFF");
     }
   }
   
@@ -304,44 +370,38 @@ void handleTimers() {
 
   uint64_t currentMillis = (uint64_t)nowSeconds * 1000ULL; 
 
-  // Light Timer Check
   if (gTimers.lightOffTime > 0 && currentMillis >= gTimers.lightOffTime) {
     gDevices.light = false;
     gTimers.lightOffTime = 0;
     Firebase.setBool(fbdoAutoApply, "/devices/light", false);
     Firebase.setInt(fbdoAutoApply, "/timers/light_off_time", 0);
     applyDevicesToHw();
-    Serial.println("[timer] Light turned OFF via timer.");
   }
 
-  // Fan Timer Check
   if (gTimers.fanOffTime > 0 && currentMillis >= gTimers.fanOffTime) {
     gDevices.fan = false;
+    gDevices.fanSpeed = 0;
     gTimers.fanOffTime = 0;
     Firebase.setBool(fbdoAutoApply, "/devices/fan", false);
+    Firebase.setInt(fbdoAutoApply, "/devices/fan_speed", 0);
     Firebase.setInt(fbdoAutoApply, "/timers/fan_off_time", 0);
     applyDevicesToHw();
-    Serial.println("[timer] Fan turned OFF via timer.");
   }
 
-  // Humidifier Timer Check
   if (gTimers.humidifierOffTime > 0 && currentMillis >= gTimers.humidifierOffTime) {
     gDevices.humidifier = false;
     gTimers.humidifierOffTime = 0;
     Firebase.setBool(fbdoAutoApply, "/devices/humidifier", false);
     Firebase.setInt(fbdoAutoApply, "/timers/humidifier_off_time", 0);
     applyDevicesToHw();
-    Serial.println("[timer] Humidifier turned OFF via timer.");
   }
 
-  // Pump Timer Check
   if (gTimers.pumpOffTime > 0 && currentMillis >= gTimers.pumpOffTime) {
     gDevices.pump = false;
     gTimers.pumpOffTime = 0;
     Firebase.setBool(fbdoAutoApply, "/devices/pump", false);
     Firebase.setInt(fbdoAutoApply, "/timers/pump_off_time", 0);
     applyDevicesToHw();
-    Serial.println("[timer] Pump turned OFF via timer.");
   }
 }
 
@@ -414,8 +474,6 @@ void onDevicesStream(StreamData data) {
   }
 
   applyDevicesToHw();
-  Serial.printf("[stream] /devices -> Light:%d Fan:%d (Spd:%d) Pump:%d Humid:%d\n",
-                gDevices.light, gDevices.fan, gDevices.fanSpeed, gDevices.pump, gDevices.humidifier);
 }
 
 void onAutomationStream(StreamData data) {
@@ -442,9 +500,6 @@ void onAutomationStream(StreamData data) {
     else if (path == "/auto_pump")       gAutomation.autoPump       = boolVal;
     else if (path == "/auto_light")      gAutomation.autoLight      = boolVal;
   }
-
-  Serial.printf("[stream] /automation -> AutoFan:%d AutoHumid:%d AutoPump:%d AutoLight:%d\n",
-                gAutomation.autoFan, gAutomation.autoHumidifier, gAutomation.autoPump, gAutomation.autoLight);
 }
 
 void onTimersStream(StreamData data) {
@@ -467,8 +522,6 @@ void onTimersStream(StreamData data) {
     else if (path == "/light_off_time")      gTimers.lightOffTime      = val;
     else if (path == "/pump_off_time")       gTimers.pumpOffTime       = val;
   }
-
-  Serial.println("[stream] /timers updated.");
 }
 
 void onStreamTimeout(bool timeout, FirebaseData& fb) {
@@ -482,30 +535,38 @@ void onStreamTimeout(bool timeout, FirebaseData& fb) {
 // ===========================================================================
 void setup() {
   Serial.begin(115200);
+
+  // 1. OLED Display Init
+  Wire.begin(PIN_OLED_SDA, PIN_OLED_SCL);
+  if (!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
+    Serial.println(F("[OLED] Allocation failed"));
+  } else {
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(15, 20);
+    display.println("Connecting WiFi...");
+    display.display();
+  }
+
   initPins();
 
-  // ১. ওয়াইফাই কানেকশন
+  // 2. Wi-Fi Connection
   WiFi.setTxPower(WIFI_POWER_17dBm);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  Serial.print("Connecting to Wi-Fi");
   while (WiFi.status() != WL_CONNECTED) {
-    Serial.print(".");
     delay(300);
   }
-  Serial.printf("\nConnected! IP: %s\n", WiFi.localIP().toString().c_str());
 
-  // ২. NTP Time Sync
+  // 3. NTP Time Sync
   configTime(0, 0, "pool.ntp.org", "time.nist.gov");
-  Serial.print("Waiting for NTP time sync...");
   time_t now = time(nullptr);
   while (now < 8 * 3600 * 2) {
     delay(500);
-    Serial.print(".");
     now = time(nullptr);
   }
-  Serial.println("\nTime Synced Successfully!");
 
-  // ৩. Firebase কনফিগারেশন
+  // 4. Firebase Config
   config.api_key = API_KEY;
   config.database_url = DATABASE_URL;
 
@@ -517,7 +578,6 @@ void setup() {
     config.token_status_callback = tokenStatusCallback;
   }
 
-  // SSL ও Buffer সেটআপ
   fbdoSensors.setBSSLBufferSize(2048, 512);
   fbdoAutoApply.setBSSLBufferSize(2048, 512);
   fbdoDevices.setBSSLBufferSize(2048, 512);
@@ -540,7 +600,6 @@ void loop() {
       startStreams();
     }
 
-    // প্রতি ৫ সেকেন্ড পর পর সেন্সর রিড, অটোমেশন, টাইমার চেক ও ডাটা পাবলিশ
     if (millis() - gLastSensorPublish > SENSOR_PERIOD_MS || gLastSensorPublish == 0) {
       gLastSensorPublish = millis();
 
@@ -548,9 +607,9 @@ void loop() {
       handleAutomation();
       handleTimers();
       publishSensors(gSensors);
+      applyDevicesToHw();
     }
 
-    // সেফটি নেট
     if (millis() - gLastStreamRestart > STREAM_RECONNECT_MS) {
       gLastStreamRestart = millis();
       if (!fbdoDevices.httpConnected()) {
